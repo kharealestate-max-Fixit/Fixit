@@ -658,3 +658,9 @@ if __name__ == "__main__":
         server.serve_forever()
     except KeyboardInterrupt:
         log(Y, "BYE", "Server stopped")
+
+@route("GET", r"/")
+async def index(request):
+    with open(os.path.join(os.path.dirname(__file__), "..", "public", "index.html")) as f:
+        return Response(f.read(), content_type="text/html")
+
