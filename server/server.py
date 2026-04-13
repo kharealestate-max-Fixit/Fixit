@@ -306,6 +306,18 @@ def read_body(handler):
     return {}
 
 # ─── Health ──────────────────────────────────────────────────────────────────
+@route("GET", r"/")
+def index(handler, match, qs, body):
+    import os
+    path = os.path.join(os.path.dirname(__file__), "..", "public", "index.html")
+    with open(path) as f: content = f.read()
+    body = content.encode()
+    handler.send_response(200)
+    handler.send_header("Content-Type", "text/html")
+    handler.send_header("Content-Length", str(len(body)))
+    handler.end_headers()
+    handler.wfile.write(body)
+
 @route("GET", r"/api/health")
 def health(handler, match, qs, body):
     json_response(handler, {"status":"ok","time":time.time(),"ws_users":len(ws_clients)})
