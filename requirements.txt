@@ -1,0 +1,5 @@
+anthropic
+flask
+flask-cors
+stripe
+flask-socketio
