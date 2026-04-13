@@ -1,0 +1,810 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FixIt — AI Home Repair</title>
+<style>
+  :root {
+    --bg:#09090b; --surface:#111115; --card:#18181c; --border:#222228;
+    --accent:#f97316; --accent2:#ef4444; --text:#f0ede8; --muted:#6b6b78;
+    --dim:#3a3a44; --green:#10b981; --blue:#3b82f6; --yellow:#f59e0b; --red:#ef4444;
+    --grad:linear-gradient(135deg,#f97316,#ef4444);
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--bg);color:var(--text);font-family:'DM Sans',system-ui,sans-serif;min-height:100vh}
+  input,textarea,button,select{font-family:inherit}
+  ::-webkit-scrollbar{width:4px} ::-webkit-scrollbar-track{background:var(--surface)} ::-webkit-scrollbar-thumb{background:var(--border);border-radius:4px}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  @keyframes slideUp{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:translateY(0)}}
+  @keyframes bounce{0%,80%,100%{transform:translateY(0)}40%{transform:translateY(-6px)}}
+  @keyframes fadeIn{from{opacity:0}to{opacity:1}}
+  @keyframes pulse{0%,100%{transform:scale(1)}50%{transform:scale(1.06)}}
+  @keyframes progress{from{width:0}to{width:100%}}
+  @keyframes ping{0%{transform:scale(1);opacity:1}75%,100%{transform:scale(1.8);opacity:0}}
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<!-- React 19 from local global install -->
+<script>
+// Polyfill process for React
+window.process = {env:{NODE_ENV:'production'}};
+</script>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+
+<script>
+const { useState, useEffect, useRef, useCallback, useMemo } = React;
+const e = React.createElement;
+
+// ─── Config ──────────────────────────────────────────────────────────────────
+const API = 'http://localhost:3001';
+const WS_URL = 'ws://localhost:3001';
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+const api = async (path, opts={}) => {
+  const r = await fetch(API + path, {headers:{'Content-Type':'application/json',...(opts.headers||{})}, ...opts, body: opts.body ? JSON.stringify(opts.body) : undefined});
+  return r.json();
+};
+
+const css = {
+  card: {background:'var(--card)',border:'1px solid var(--border)',borderRadius:18,padding:20},
+  btn: (v='primary') => ({
+    padding: v==='sm'?'7px 14px':v==='xs'?'5px 10px':'13px 18px',
+    borderRadius: v==='xs'?8:12, border:'none',
+    fontWeight:700, fontSize: v==='sm'||v==='xs'?12:14,
+    cursor:'pointer', fontFamily:'inherit',
+    background: v==='primary'?'var(--grad)':v==='green'?'var(--green)':v==='ghost'?'transparent':'var(--surface)',
+    color: v==='ghost'?'var(--muted)':'#fff',
+    outline: v==='ghost'?'1px solid var(--border)':'none',
+    transition:'opacity .15s',
+  }),
+  input: {background:'var(--surface)',border:'1px solid var(--border)',borderRadius:10,padding:'11px 14px',color:'var(--text)',fontSize:14,width:'100%',outline:'none'},
+  badge: (c='var(--accent)') => ({background:`${c}22`,color:c,fontSize:11,fontWeight:700,padding:'3px 9px',borderRadius:20,display:'inline-block'}),
+  label: {fontSize:10,color:'var(--muted)',fontWeight:700,letterSpacing:1,textTransform:'uppercase',display:'block',marginBottom:6},
+};
+
+// ─── WebSocket hook ───────────────────────────────────────────────────────────
+function useWS(userId) {
+  const ws = useRef(null);
+  const listeners = useRef({});
+  const [connected, setConnected] = useState(false);
+  const reconnTimer = useRef(null);
+  const attempts = useRef(0);
+
+  const connect = useCallback(() => {
+    if (!userId) return;
+    try {
+      const sock = new WebSocket(`${WS_URL}?userId=${userId}`);
+      sock.onopen = () => { setConnected(true); attempts.current=0; console.log('[WS] connected'); };
+      sock.onmessage = ev => {
+        try {
+          const msg = JSON.parse(ev.data);
+          (listeners.current[msg.type]||[]).forEach(fn=>fn(msg));
+          (listeners.current['*']||[]).forEach(fn=>fn(msg));
+        } catch {}
+      };
+      sock.onclose = () => {
+        setConnected(false);
+        const delay = Math.min(1000*2**attempts.current, 15000);
+        attempts.current++;
+        reconnTimer.current = setTimeout(connect, delay);
+      };
+      sock.onerror = ()=>{};
+      ws.current = sock;
+    } catch(e) { console.warn('[WS] Could not connect:', e.message); }
+  }, [userId]);
+
+  useEffect(() => { connect(); return ()=>{ clearTimeout(reconnTimer.current); ws.current?.close(); }; }, [connect]);
+
+  const send = useCallback(data => { if(ws.current?.readyState===1) ws.current.send(JSON.stringify(data)); }, []);
+  const on = useCallback((type, fn) => {
+    if(!listeners.current[type]) listeners.current[type]=[];
+    listeners.current[type].push(fn);
+    return ()=>{ listeners.current[type]=listeners.current[type].filter(f=>f!==fn); };
+  }, []);
+
+  return {connected, send, on};
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MAIN APP TABS
+// ═══════════════════════════════════════════════════════════════════════════════
+const TABS = [
+  {id:'homeowner', label:'🏠', name:'Book'},
+  {id:'chat',      label:'💬', name:'Chat'},
+  {id:'map',       label:'🗺',  name:'Map'},
+  {id:'push',      label:'🔔', name:'Alerts'},
+  {id:'dashboard', label:'📊', name:'Dashboard'},
+];
+
+// ─── Homeowner booking flow ───────────────────────────────────────────────────
+function HomeownerTab({ws}) {
+  const [step, setStep] = useState('capture');
+  const [category, setCategory] = useState('');
+  const [description, setDescription] = useState('');
+  const [analysis, setAnalysis] = useState(null);
+  const [contractors, setContractors] = useState([]);
+  const [selected, setSelected] = useState(null);
+  const [booking, setBooking] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [progress, setProgress] = useState(0);
+  const [payStep, setPayStep] = useState('form');
+  const [cardNum, setCardNum] = useState('4242 4242 4242 4242');
+  const [expiry, setExpiry] = useState('12/27');
+  const [cvv, setCvv] = useState('···');
+  const [liveStats, setLiveStats] = useState(null);
+
+  const cats = ['💧 Plumbing','⚡ Electrical','🔥 HVAC','🏠 Roofing','🪟 Windows','🪣 Flooring','🚪 Doors','🔧 General'];
+  const sevColor = {Low:'var(--green)',Moderate:'var(--yellow)',High:'var(--accent)',Emergency:'var(--red)'};
+
+  // Fetch live stats
+  useEffect(()=>{
+    api('/api/stats').then(setLiveStats).catch(()=>{});
+  },[step]);
+
+  // Listen for WS events
+  useEffect(()=>{
+    return ws.on('booking_paid', msg => {
+      if(booking && msg.bookingId==booking.id) setStep('confirmed');
+    });
+  },[ws, booking]);
+
+  const analyze = async () => {
+    if(!category && !description) return;
+    setLoading(true); setStep('analyzing'); setProgress(0);
+    const iv = setInterval(()=>setProgress(p=>Math.min(p+9,90)),200);
+    try {
+      const r = await api('/api/analyze',{method:'POST',body:{category:category.replace(/^\S+ /,''), description}});
+      setAnalysis(r);
+      clearInterval(iv); setProgress(100);
+      setTimeout(async ()=>{
+        const r2 = await api(`/api/contractors/nearby?lat=34.052&lng=-118.248&radius=10&category=${encodeURIComponent(category.replace(/^\S+ /,''))}`);
+        setContractors(r2.contractors||[]);
+        setLoading(false); setStep('results');
+      }, 500);
+    } catch(e) { clearInterval(iv); setLoading(false); setStep('capture'); }
+  };
+
+  const book = async (contractor) => {
+    setSelected(contractor);
+    const r = await api('/api/bookings',{method:'POST',body:{contractorId:contractor.id,homeownerId:4,category:category.replace(/^\S+ /,''),description,estPrice:contractor.base_price,scheduledAt:new Date(Date.now()+3600000).toISOString()}});
+    setBooking(r.booking);
+    setStep('pay');
+  };
+
+  const pay = async () => {
+    setPayStep('processing');
+    await api('/api/payments/create-intent',{method:'POST',body:{contractorId:selected.id,bookingId:booking.id,amount:Math.round((selected.base_price+9.99)*100)}});
+    setTimeout(()=>{ setPayStep('done'); setTimeout(()=>setStep('confirmed'),800); },1800);
+  };
+
+  if(step==='confirmed') return e('div',{style:{textAlign:'center',padding:'40px 0'}},
+    e('div',{style:{width:80,height:80,borderRadius:'50%',background:'var(--green)',display:'flex',alignItems:'center',justifyContent:'center',fontSize:36,margin:'0 auto 20px'}},'✓'),
+    e('h2',{style:{fontWeight:800,fontSize:24,marginBottom:8}},'Booking Confirmed!'),
+    e('p',{style:{color:'var(--muted)',marginBottom:24}},selected?.business_name,' is on the way'),
+    e('div',{style:{...css.card,marginBottom:20,textAlign:'left'}},
+      ...['Contractor','Arrival','Amount'].map((l,i)=>
+        e('div',{key:l,style:{display:'flex',justifyContent:'space-between',padding:'9px 0',borderBottom:'1px solid var(--border)',fontSize:14}},
+          e('span',{style:{color:'var(--muted)'}},l),
+          e('span',{style:{fontWeight:600}},[selected?.business_name,'~2hrs','$'+(selected?.base_price+9.99).toFixed(2)][i])
+        )
+      )
+    ),
+    e('button',{style:{...css.btn(),width:'100%'},onClick:()=>{setStep('capture');setCategory('');setDescription('');setAnalysis(null);setSelected(null);setBooking(null);setPayStep('form')}},'Book Another Repair')
+  );
+
+  if(step==='pay') return e('div',null,
+    e('div',{style:{display:'flex',alignItems:'center',gap:8,marginBottom:16}},
+      e('div',{style:{background:'#635BFF',borderRadius:6,padding:'3px 8px',fontSize:12,fontWeight:800,color:'#fff'}},'stripe'),
+      e('span',{style:{fontSize:12,color:'var(--muted)'}},'Secure checkout'),
+      e('span',{style:{marginLeft:'auto',fontSize:11,color:'var(--green)'}},'🔒 Connected to real API')
+    ),
+    e('div',{style:{...css.card,marginBottom:14}},
+      e('div',{style:{display:'flex',justifyContent:'space-between',alignItems:'center'}},
+        e('div',null,e('div',{style:{fontWeight:700}},selected?.business_name),e('div',{style:{fontSize:12,color:'var(--muted)'}},category,' repair')),
+        e('div',{style:{fontWeight:800,fontSize:20,color:'var(--accent)'}},'$'+(selected?.base_price+9.99).toFixed(2))
+      ),
+      e('div',{style:{borderTop:'1px solid var(--border)',marginTop:12,paddingTop:10}},
+        ...(['Service fee','Platform fee','Tax']).map((l,i)=>
+          e('div',{key:l,style:{display:'flex',justifyContent:'space-between',fontSize:13,marginTop:5}},
+            e('span',{style:{color:'var(--muted)'}},l),
+            e('span',null,['$'+selected?.base_price,'$9.99','$0.00'][i])
+          )
+        )
+      )
+    ),
+    payStep==='processing'
+      ? e('div',{style:{textAlign:'center',padding:'32px 0'}},
+          e('div',{style:{width:52,height:52,borderRadius:'50%',border:'3px solid var(--accent)',borderTop:'3px solid transparent',margin:'0 auto 16px',animation:'spin .8s linear infinite'}}),
+          e('p',{style:{color:'var(--accent)',fontWeight:700}},'Processing payment...'))
+      : e('div',null,
+          e('div',{style:{...css.card,marginBottom:14}},
+            e('label',{style:css.label},'Card number'),
+            e('input',{style:{...css.input,marginBottom:10},value:cardNum,onChange:ev=>setCardNum(ev.target.value)}),
+            e('div',{style:{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10}},
+              e('div',null,e('label',{style:css.label},'Expiry'),e('input',{style:css.input,value:expiry,onChange:ev=>setExpiry(ev.target.value)})),
+              e('div',null,e('label',{style:css.label},'CVV'),e('input',{style:css.input,value:cvv,onChange:ev=>setCvv(ev.target.value),type:'password'}))
+            )
+          ),
+          e('div',{style:{display:'flex',gap:8}},
+            e('button',{style:{...css.btn('ghost'),flex:'0 0 44px'},onClick:()=>setStep('results')},'←'),
+            e('button',{style:{...css.btn(),flex:1},onClick:pay},'Pay $'+(selected?.base_price+9.99).toFixed(2)+' →')
+          ),
+          e('p',{style:{textAlign:'center',fontSize:11,color:'var(--dim)',marginTop:10}},'Payments processed via Stripe Connect · '+(booking?'Booking #'+booking.id:''))
+        )
+  );
+
+  if(step==='analyzing') return e('div',{style:{textAlign:'center',padding:'52px 0'}},
+    e('div',{style:{width:80,height:80,borderRadius:'50%',background:'var(--grad)',display:'flex',alignItems:'center',justifyContent:'center',fontSize:36,margin:'0 auto 22px',animation:'pulse 1.5s ease-in-out infinite'}},'🔍'),
+    e('h3',{style:{fontWeight:800,fontSize:20,marginBottom:6}},'Analyzing your issue'),
+    e('p',{style:{color:'var(--muted)',fontSize:13,marginBottom:24}},'AI is diagnosing and finding contractors nearby'),
+    e('div',{style:{background:'var(--surface)',borderRadius:8,height:6,marginBottom:12}},
+      e('div',{style:{height:'100%',background:'var(--grad)',borderRadius:8,width:progress+'%',transition:'width .3s'}})),
+    e('p',{style:{color:'var(--accent)',fontSize:12,fontWeight:700}},
+      progress<35?'📡 Connecting to AI...':progress<65?'🧠 Diagnosing issue...':progress<90?'📍 Finding contractors...':'✅ Building quotes...')
+  );
+
+  if(step==='results' && analysis) return e('div',null,
+    e('div',{style:{...css.card,marginBottom:14,border:`1px solid ${sevColor[analysis.severity]||'var(--border)'}40`}},
+      e('div',{style:{display:'flex',justifyContent:'space-between',alignItems:'flex-start',marginBottom:10}},
+        e('div',null,
+          e('div',{style:{fontSize:10,color:'var(--muted)',fontWeight:700,marginBottom:4}},'🤖 AI DIAGNOSIS'+(analysis.simulated?' (MOCK — add ANTHROPIC_API_KEY)':' (LIVE)')),
+          e('div',{style:{fontWeight:800,fontSize:17}},analysis.issue),
+          e('span',{style:css.badge(sevColor[analysis.severity]||'var(--accent)')},analysis.severity,' · ',analysis.urgency)
+        ),
+        e('div',{style:{textAlign:'right'}},
+          e('div',{style:{fontSize:11,color:'var(--muted)'}},'Est. Cost'),
+          e('div',{style:{fontWeight:800,fontSize:20,color:'var(--accent)'}},'$',analysis.estimateLow,'–$',analysis.estimateHigh)
+        )
+      ),
+      e('p',{style:{fontSize:13,color:'#a0a0b0',lineHeight:1.5,margin:'10px 0'}},analysis.description),
+      analysis.tips?.length && e('div',{style:{borderTop:'1px solid var(--border)',paddingTop:10,marginTop:8}},
+        analysis.tips.map((t,i)=>e('div',{key:i,style:{fontSize:12,color:'var(--muted)',marginTop:4}},'💡 ',t))
+      )
+    ),
+    e('h3',{style:{fontWeight:800,fontSize:17,marginBottom:12}},contractors.length,' Contractors Found'),
+    contractors.map((c,i)=>
+      e('div',{key:c.id,style:{...css.card,marginBottom:12,animation:`slideUp .3s ease ${i*.08}s both`}},
+        e('div',{style:{display:'flex',gap:12,marginBottom:12}},
+          e('div',{style:{width:46,height:46,borderRadius:13,background:'var(--grad)',display:'flex',alignItems:'center',justifyContent:'center',fontWeight:800,fontSize:13,flexShrink:0}},c.avatar),
+          e('div',{style:{flex:1}},
+            e('div',{style:{fontWeight:700,fontSize:14}},c.business_name,' ',c.verified?'✅':''),
+            e('div',{style:{display:'flex',gap:8,marginTop:3}},
+              e('span',{style:{fontSize:13,color:'var(--yellow)'}},'★ ',c.rating),
+              e('span',{style:{fontSize:12,color:'var(--muted)'}},c.review_count,' reviews'),
+              e('span',{style:css.badge(c.status==='available'?'var(--green)':'var(--yellow)')},c.status)
+            )
+          ),
+          e('div',{style:{textAlign:'right'}},
+            e('div',{style:{fontWeight:800,fontSize:20}},'$',c.base_price),
+            e('div',{style:{fontSize:11,color:'var(--muted)'}},c.distance_miles,'mi · ',c.eta_human)
+          )
+        ),
+        e('div',{style:{display:'flex',justifyContent:'space-between',alignItems:'center',paddingTop:10,borderTop:'1px solid var(--border)'}},
+          e('div',{style:{fontSize:12,color:'var(--muted)'}},c.specialties.slice(0,2).join(' · ')),
+          e('button',{style:{...css.btn('sm'),background:'var(--grad)'},onClick:()=>book(c)},'Book Now →')
+        )
+      )
+    )
+  );
+
+  // CAPTURE step
+  return e('div',null,
+    e('h1',{style:{fontSize:28,fontWeight:800,letterSpacing:-.5,marginBottom:6,lineHeight:1.1}},
+      'What needs ',e('span',{style:{color:'var(--accent)'}},'fixing?')),
+    e('p',{style:{color:'var(--muted)',fontSize:13,marginBottom:20}},'Real backend running · WebSocket ',ws.connected?e('span',{style:{color:'var(--green)'}},'●connected'):e('span',{style:{color:'var(--red)'}},'●offline')),
+
+    // Live stats
+    liveStats && e('div',{style:{display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:8,marginBottom:20}},
+      ...Object.entries({Bookings:liveStats.bookings,Messages:liveStats.messages,'WS Live':liveStats.ws_connections}).map(([k,v])=>
+        e('div',{key:k,style:{...css.card,textAlign:'center',padding:12}},
+          e('div',{style:{fontWeight:800,fontSize:20,color:'var(--accent)'}},v),
+          e('div',{style:{fontSize:10,color:'var(--muted)'}},k)
+        )
+      )
+    ),
+
+    e('label',{style:css.label},'Category'),
+    e('div',{style:{display:'grid',gridTemplateColumns:'repeat(4,1fr)',gap:8,marginBottom:16}},
+      cats.map(c=>e('button',{key:c,onClick:()=>setCategory(c),style:{background:category===c?'var(--accent)':'var(--card)',border:`1.5px solid ${category===c?'var(--accent)':'var(--border)'}`,borderRadius:12,padding:'10px 4px',cursor:'pointer',display:'flex',flexDirection:'column',alignItems:'center',gap:4,transition:'all .15s'}},
+        e('span',{style:{fontSize:20}},c.split(' ')[0]),
+        e('span',{style:{fontSize:10,fontWeight:700,color:category===c?'#fff':'var(--muted)'}},c.replace(/^\S+ /,''))
+      ))
+    ),
+
+    e('label',{style:css.label},'Describe the issue'),
+    e('textarea',{style:{...css.input,resize:'none',marginBottom:16,lineHeight:1.5},rows:3,placeholder:"E.g. 'Leaking pipe under kitchen sink, water pooling on floor'",value:description,onChange:ev=>setDescription(ev.target.value)}),
+
+    e('button',{style:{...css.btn(),width:'100%',opacity:category||description?1:.4},onClick:analyze},'🤖 Analyze & Find Contractors →'),
+    e('p',{style:{textAlign:'center',fontSize:11,color:'var(--dim)',marginTop:10}},'Backend: ',API,' · SQLite DB active')
+  );
+}
+
+// ─── Real-time Chat ───────────────────────────────────────────────────────────
+function ChatTab({ws}) {
+  const ROOM_ID = 1; // Demo room
+  const USER_ID = 4; // homeowner
+  const [messages, setMessages] = useState([]);
+  const [input, setInput] = useState('');
+  const [isTyping, setIsTyping] = useState(false);
+  const [sending, setSending] = useState(false);
+  const [viewAs, setViewAs] = useState('homeowner');
+  const [connected, setConnected] = useState(ws.connected);
+  const bottomRef = useRef();
+  const typingTimer = useRef();
+
+  useEffect(()=>{
+    // Load history from real backend
+    api(`/api/chat/${ROOM_ID}/messages`).then(msgs=>{
+      if(msgs.length===0) {
+        // Seed a welcome message
+        setMessages([{id:'w1',sender_name:'System',text:'Chat room ready. Messages are stored in SQLite and delivered via WebSocket.',msg_type:'system',created_at:new Date().toISOString()}]);
+      } else setMessages(msgs);
+    }).catch(()=>{});
+  },[]);
+
+  useEffect(()=>{
+    const unsub = ws.on('new_message', msg=>{
+      if(msg.chatRoomId===ROOM_ID) setMessages(p=>[...p, msg.message]);
+    });
+    const unsubTyping = ws.on('typing', msg=>{
+      if(msg.chatRoomId===ROOM_ID){ setIsTyping(true); clearTimeout(typingTimer.current); typingTimer.current=setTimeout(()=>setIsTyping(false),3000); }
+    });
+    return ()=>{ unsub(); unsubTyping(); };
+  },[ws]);
+
+  useEffect(()=>{ bottomRef.current?.scrollIntoView({behavior:'smooth'}); },[messages,isTyping]);
+
+  const send = async ()=>{
+    if(!input.trim()) return;
+    setSending(true);
+    const text = input; setInput('');
+    const sender = viewAs==='homeowner'?USER_ID:1; // 1=Mario contractor
+    try {
+      const msg = await api(`/api/chat/${ROOM_ID}/messages`,{method:'POST',body:{senderId:sender,text}});
+      setMessages(p=>[...p,msg]);
+    } catch(e){ console.error(e); }
+    setSending(false);
+  };
+
+  const sendSpecial = async (type, text) => {
+    const msg = await api(`/api/chat/${ROOM_ID}/messages`,{method:'POST',body:{senderId:1,text,type}});
+    setMessages(p=>[...p,{...msg,msg_type:type}]);
+  };
+
+  const isMe = msg => (viewAs==='homeowner' && msg.sender_id===USER_ID) || (viewAs==='contractor' && msg.sender_id===1);
+
+  return e('div',null,
+    // Header
+    e('div',{style:{display:'flex',alignItems:'center',gap:10,marginBottom:14}},
+      e('div',{style:{width:40,height:40,borderRadius:12,background:'var(--grad)',display:'flex',alignItems:'center',justifyContent:'center',fontWeight:800,fontSize:13}},'MP'),
+      e('div',{style:{flex:1}},
+        e('div',{style:{fontWeight:700,fontSize:14}},'Martinez Pro Plumbing'),
+        e('div',{style:{fontSize:11,color:ws.connected?'var(--green)':'var(--muted)'}},ws.connected?'● WebSocket Live':'● Reconnecting...')
+      ),
+      e('span',{style:css.badge(ws.connected?'var(--green)':'var(--yellow)')},ws.connected?'WS ●':'WS ○')
+    ),
+
+    // View toggle
+    e('div',{style:{display:'flex',background:'var(--surface)',borderRadius:10,padding:3,marginBottom:12}},
+      ['homeowner','contractor'].map(v=>e('button',{key:v,onClick:()=>setViewAs(v),style:{flex:1,padding:'7px',borderRadius:8,border:'none',fontSize:12,fontWeight:700,cursor:'pointer',fontFamily:'inherit',background:viewAs===v?'var(--accent)':'transparent',color:viewAs===v?'#fff':'var(--muted)',transition:'all .2s'}},v==='homeowner'?'🏠 Homeowner':'🔨 Contractor'))
+    ),
+
+    // Messages
+    e('div',{style:{...css.card,height:280,overflowY:'auto',marginBottom:12,display:'flex',flexDirection:'column',gap:10,padding:'14px'}},
+      messages.map(msg=>{
+        const me = isMe(msg);
+        if(msg.msg_type==='system') return e('div',{key:msg.id,style:{textAlign:'center',fontSize:11,color:'var(--dim)',padding:'4px 0'}},msg.text);
+        if(msg.msg_type==='quote') return e('div',{key:msg.id,style:{alignSelf:'flex-start',maxWidth:'85%'}},
+          e('div',{style:{background:'rgba(16,185,129,.12)',border:'1px solid rgba(16,185,129,.3)',borderRadius:14,padding:14}},
+            e('div',{style:{fontSize:10,color:'var(--green)',fontWeight:700,marginBottom:6}},'💼 JOB QUOTE'),
+            e('div',{style:{fontWeight:800,fontSize:22,color:'var(--green)',marginBottom:4}},'$185'),
+            e('div',{style:{fontSize:12,color:'var(--muted)',marginBottom:10}},'Kitchen sink leak repair · Parts + labor'),
+            e('div',{style:{display:'flex',gap:8}},
+              e('button',{style:{...css.btn('sm'),background:'var(--green)'}},'✓ Accept'),
+              e('button',{style:css.btn('ghost')},'Decline')
+            )
+          )
+        );
+        return e('div',{key:msg.id,style:{alignSelf:me?'flex-end':'flex-start',maxWidth:'80%',display:'flex',flexDirection:'column',gap:3}},
+          e('div',{style:{background:me?'var(--accent)':'var(--surface)',borderRadius:me?'14px 14px 4px 14px':'14px 14px 14px 4px',padding:'9px 13px',fontSize:13,lineHeight:1.5}},msg.text),
+          e('div',{style:{fontSize:10,color:'var(--dim)',textAlign:me?'right':'left'}},
+            msg.sender_name,' · ',new Date(msg.created_at).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})
+          )
+        );
+      }),
+      isTyping && e('div',{style:{alignSelf:'flex-start'}},
+        e('div',{style:{background:'var(--surface)',borderRadius:'14px 14px 14px 4px',padding:'10px 14px',display:'flex',gap:4}},
+          [0,1,2].map(i=>e('div',{key:i,style:{width:6,height:6,borderRadius:'50%',background:'var(--muted)',animation:`bounce 1s ease ${i*.2}s infinite`}}))
+        )
+      ),
+      e('div',{ref:bottomRef})
+    ),
+
+    // Quick actions
+    viewAs==='contractor' && e('div',{style:{display:'flex',gap:6,marginBottom:8}},
+      e('button',{style:{...css.btn('ghost'),flex:1,fontSize:11},onClick:()=>sendSpecial('quote','[quote]')},'💼 Send Quote'),
+      e('button',{style:{...css.btn('ghost'),flex:1,fontSize:11},onClick:()=>sendSpecial('text','I can be there at 2pm — does that work?')},'⏰ Confirm Time')
+    ),
+
+    // Input
+    e('div',{style:{display:'flex',gap:8}},
+      e('input',{style:{...css.input,flex:1},value:input,onChange:ev=>setInput(ev.target.value),onKeyDown:ev=>ev.key==='Enter'&&send(),placeholder:'Message... (Enter to send)',
+        onInput:()=>ws.send({type:'typing',chatRoomId:ROOM_ID})}),
+      e('button',{style:{...css.btn(),flexShrink:0,padding:'11px 16px',opacity:input.trim()&&!sending?1:.4},onClick:send},sending?'…':'↑')
+    ),
+    e('p',{style:{textAlign:'center',fontSize:10,color:'var(--dim)',marginTop:8}},'Messages stored in SQLite · Real-time via WebSocket RFC 6455')
+  );
+}
+
+// ─── Map tab ──────────────────────────────────────────────────────────────────
+function MapTab() {
+  const [contractors, setContractors] = useState([]);
+  const [selected, setSelected] = useState(null);
+  const [radius, setRadius] = useState(5);
+  const [lat, setLat] = useState(34.052);
+  const [lng, setLng] = useState(-118.248);
+  const [loading, setLoading] = useState(false);
+
+  const fetchContractors = useCallback(async ()=>{
+    setLoading(true);
+    try {
+      const r = await api(`/api/contractors/nearby?lat=${lat}&lng=${lng}&radius=${radius}`);
+      setContractors(r.contractors||[]);
+    } finally { setLoading(false); }
+  },[lat,lng,radius]);
+
+  useEffect(()=>{ fetchContractors(); },[fetchContractors]);
+
+  // Map projection
+  const mapW=320, mapH=220;
+  const cx = l => ((l-(-118.26))/0.028)*mapW+15;
+  const cy = l => ((34.062-l)/0.022)*mapH+10;
+  const userX=cx(lng), userY=cy(lat);
+
+  return e('div',null,
+    e('div',{style:{marginBottom:14}},
+      e('h2',{style:{fontWeight:800,fontSize:20}},'Live Geo Search'),
+      e('p',{style:{color:'var(--muted)',fontSize:13,marginTop:2}},'Haversine distance · Real SQLite query')
+    ),
+
+    // Radius slider
+    e('div',{style:{marginBottom:12}},
+      e('div',{style:{display:'flex',justifyContent:'space-between',marginBottom:6}},
+        e('label',{style:{...css.label,marginBottom:0}},'Radius'),
+        e('span',{style:{fontSize:13,fontWeight:700,color:'var(--accent)'}},radius,' miles')
+      ),
+      e('input',{type:'range',min:1,max:20,value:radius,onChange:ev=>setRadius(+ev.target.value),style:{width:'100%',accentColor:'var(--accent)'}})
+    ),
+
+    // SVG Map
+    e('div',{style:{...css.card,padding:0,overflow:'hidden',marginBottom:14}},
+      e('svg',{viewBox:`0 0 ${mapW+30} ${mapH+30}`,style:{width:'100%',display:'block',background:'#0d0d12'}},
+        // Grid
+        [60,120,180,240,290].map(x=>e('line',{key:x,x1:x,y1:0,x2:x,y2:mapH+30,stroke:'#13131a',strokeWidth:1})),
+        [44,88,132,176,220].map(y=>e('line',{key:y,x1:0,y1:y,x2:mapW+30,y2:y,stroke:'#13131a',strokeWidth:1})),
+        // Streets
+        e('line',{x1:0,y1:cy(34.051),x2:mapW+30,y2:cy(34.051),stroke:'#161620',strokeWidth:7}),
+        e('line',{x1:cx(-118.245),y1:0,x2:cx(-118.245),y2:mapH+30,stroke:'#161620',strokeWidth:7}),
+        // Radius
+        e('circle',{cx:userX,cy:userY,r:radius*12,fill:'rgba(249,115,22,.05)',stroke:'rgba(249,115,22,.15)',strokeWidth:1,strokeDasharray:'4 3'}),
+        // Lines to contractors
+        ...contractors.map(c=>e('line',{key:c.id,x1:userX,y1:userY,x2:cx(c.lng||(-118.24+c.id*.01)),y2:cy(c.lat||(34.05+c.id*.004)),stroke:selected?.id===c.id?'var(--accent)':'#222230',strokeWidth:selected?.id===c.id?1.5:.7,strokeDasharray:'3 3'})),
+        // Contractor pins
+        ...contractors.map(c=>{
+          const px=cx(c.lng||(-118.24+c.id*.01)), py=cy(c.lat||(34.05+c.id*.004));
+          const sel=selected?.id===c.id;
+          return e('g',{key:c.id,style:{cursor:'pointer'},onClick:()=>setSelected(sel?null:c)},
+            e('circle',{cx:px,cy:py,r:sel?26:18,fill:`rgba(249,115,22,${sel?.15:.05})`}),
+            e('circle',{cx:px,cy:py,r:sel?18:13,fill:sel?'var(--accent)':'#1a1a24',stroke:sel?'var(--accent)':'#333',strokeWidth:1.5}),
+            e('text',{x:px,y:py+4,textAnchor:'middle',fontSize:9,fontWeight:'700',fill:sel?'#fff':'#9090a0',fontFamily:'inherit'},c.avatar),
+            e('circle',{cx:px+9,cy:py-9,r:4,fill:c.status==='available'?'var(--green)':'var(--yellow)',stroke:'#09090b',strokeWidth:1.5}),
+            sel && e('g',null,
+              e('rect',{x:px-44,y:py-40,width:88,height:22,rx:5,fill:'var(--accent)'}),
+              e('text',{x:px,y:py-25,textAnchor:'middle',fontSize:9,fill:'#fff',fontWeight:'700',fontFamily:'inherit'},c.business_name.split(' ').slice(0,2).join(' '))
+            )
+          );
+        }),
+        // User
+        e('circle',{cx:userX,cy:userY,r:18,fill:'rgba(59,130,246,.2)'}),
+        e('circle',{cx:userX,cy:userY,r:11,fill:'var(--blue)'}),
+        e('circle',{cx:userX,cy:userY,r:5,fill:'#fff'}),
+        e('text',{x:userX,y:userY+25,textAnchor:'middle',fontSize:8,fill:'var(--blue)',fontWeight:'700',fontFamily:'inherit'},'YOU')
+      )
+    ),
+
+    // Contractor list
+    loading && e('p',{style:{color:'var(--muted)',fontSize:13,textAlign:'center'}},'Querying database...'),
+    e('div',{style:{fontSize:10,color:'var(--muted)',fontWeight:700,letterSpacing:1,marginBottom:8}},'RESULTS FROM REAL DATABASE (',contractors.length,' found)'),
+    contractors.map(c=>e('div',{key:c.id,style:{...css.card,marginBottom:10,display:'flex',gap:12,alignItems:'center',cursor:'pointer',border:`1px solid ${selected?.id===c.id?'var(--accent)':'var(--border)'}`},onClick:()=>setSelected(selected?.id===c.id?null:c)},
+      e('div',{style:{width:38,height:38,borderRadius:10,background:'var(--grad)',display:'flex',alignItems:'center',justifyContent:'center',fontWeight:800,fontSize:12,flexShrink:0}},c.avatar),
+      e('div',{style:{flex:1}},
+        e('div',{style:{fontWeight:700,fontSize:13}},c.business_name),
+        e('div',{style:{fontSize:11,color:'var(--muted)'}},c.distance_miles,' mi · ',c.eta_human,' · ★',c.rating)
+      ),
+      e('span',{style:css.badge(c.status==='available'?'var(--green)':'var(--yellow)')},c.status)
+    )),
+
+    e('div',{style:{...css.card,padding:14}},
+      e('div',{style:{fontSize:10,color:'var(--muted)',fontWeight:700,letterSpacing:1,marginBottom:8}},'LIVE QUERY'),
+      e('pre',{style:{fontSize:11,color:'#7a9fcc',margin:0,whiteSpace:'pre-wrap',lineHeight:1.6,fontFamily:'monospace'}},
+        `GET /api/contractors/nearby\n  ?lat=${lat}&lng=${lng}\n  &radius=${radius}\n\nHaversine(lat1,lng1,lat2,lng2)\n→ Found ${contractors.length} in ${radius}mi`)
+    )
+  );
+}
+
+// ─── Push Notifications ───────────────────────────────────────────────────────
+function PushTab({ws}) {
+  const [notifs, setNotifs] = useState([]);
+  const [subbed, setSubbed] = useState(false);
+  const [sending, setSending] = useState(null);
+  const [filter, setFilter] = useState('all');
+
+  // Listen for real WS events
+  useEffect(()=>{
+    return ws.on('*', msg=>{
+      if(['new_lead','booking_paid','new_message'].includes(msg.type)){
+        const icons = {new_lead:'📥',booking_paid:'💰',new_message:'💬'};
+        const colors = {new_lead:'var(--accent)',booking_paid:'var(--green)',new_message:'var(--blue)'};
+        setNotifs(p=>[{id:Date.now(),type:msg.type,icon:icons[msg.type],title:msg.message||msg.type,body:JSON.stringify(msg).slice(0,60),color:colors[msg.type],time:'just now',read:false,live:true},...p]);
+      }
+    });
+  },[ws]);
+
+  const simulate = async type => {
+    setSending(type);
+    const demos = {
+      lead: {type:'new_lead',icon:'📥',title:'New Lead!',body:'Drywall repair · $120–$180 · 0.4 mi',color:'var(--accent)'},
+      payment: {type:'payment',icon:'💰',title:'Payment Received',body:'$194.99 deposited via Stripe',color:'var(--green)'},
+      message: {type:'message',icon:'💬',title:'New Message',body:'I can arrive at 2pm — does that work?',color:'var(--blue)'},
+      review: {type:'review',icon:'⭐',title:'5-Star Review',body:'"Fast and professional, highly recommend!"',color:'var(--yellow)'},
+    };
+    await new Promise(r=>setTimeout(r,900));
+    setNotifs(p=>[{...demos[type],id:Date.now(),time:'just now',read:false},...p]);
+    setSending(null);
+  };
+
+  // Request real browser push permission
+  const enablePush = async () => {
+    if(!('Notification' in window)){ alert('Notifications not supported in this context'); return; }
+    const perm = await Notification.requestPermission();
+    if(perm==='granted'){
+      setSubbed(true);
+      new Notification('FixIt Notifications Active',{body:'You will receive alerts for new leads and payments!',icon:'/icon.png'});
+    }
+  };
+
+  const unread = notifs.filter(n=>!n.read).length;
+  const filtered = filter==='all'?notifs:notifs.filter(n=>n.type.includes(filter));
+
+  return e('div',null,
+    e('div',{style:{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:14}},
+      e('div',null,
+        e('h2',{style:{fontWeight:800,fontSize:20}},'Push Notifications'),
+        e('p',{style:{color:'var(--muted)',fontSize:13,marginTop:2}},'Web Push API · Live via WebSocket')
+      ),
+      unread>0 && e('span',{style:css.badge('var(--accent)')},unread,' new')
+    ),
+
+    // Permission toggle
+    e('div',{style:{...css.card,marginBottom:14,border:`1px solid ${subbed?'rgba(16,185,129,.4)':'var(--border)'}`}},
+      e('div',{style:{display:'flex',alignItems:'center',gap:12}},
+        e('div',{style:{fontSize:24}},'🔔'),
+        e('div',{style:{flex:1}},
+          e('div',{style:{fontWeight:700,fontSize:14}},subbed?'Browser Notifications Active':'Enable Push Notifications'),
+          e('div',{style:{fontSize:12,color:'var(--muted)'}},subbed?'Real browser alerts enabled':'Alerts work even when app is closed')
+        ),
+        e('button',{style:{...css.btn(subbed?'ghost':'primary'),padding:'7px 14px',fontSize:12},onClick:subbed?()=>setSubbed(false):enablePush},subbed?'Disable':'Enable')
+      ),
+      ws.connected && e('div',{style:{marginTop:10,paddingTop:10,borderTop:'1px solid var(--border)',fontSize:12,color:'var(--muted)'}},'✓ WebSocket connected · Real-time events active')
+    ),
+
+    // Trigger buttons
+    e('label',{style:css.label},'Simulate notification'),
+    e('div',{style:{display:'grid',gridTemplateColumns:'1fr 1fr',gap:8,marginBottom:14}},
+      [['lead','📥 New Lead','var(--accent)'],['payment','💰 Payment','var(--green)'],['message','💬 Message','var(--blue)'],['review','⭐ Review','var(--yellow)']].map(([type,label,color])=>
+        e('button',{key:type,onClick:()=>simulate(type),disabled:!!sending,style:{...css.btn('ghost'),fontSize:13,outline:`1px solid ${color}40`,color,position:'relative',overflow:'hidden'}},
+          sending===type?e('span',null,'Sending...'):[label,sending===type&&e('div',{key:'p',style:{position:'absolute',bottom:0,left:0,height:2,background:color,animation:'progress 0.9s linear'}})]
+        )
+      )
+    ),
+
+    // Filter
+    e('div',{style:{display:'flex',gap:6,marginBottom:12,overflowX:'auto'}},
+      ['all','lead','payment','message','review'].map(f=>
+        e('button',{key:f,onClick:()=>setFilter(f),style:{...css.btn(filter===f?'primary':'ghost'),padding:'6px 12px',fontSize:11,flexShrink:0,textTransform:'capitalize'}},f)
+      ),
+      notifs.length>0 && e('button',{onClick:()=>setNotifs([]),style:{...css.btn('ghost'),padding:'6px 12px',fontSize:11,color:'var(--red)',outline:'1px solid rgba(239,68,68,.3)',flexShrink:0,marginLeft:'auto'}},'Clear')
+    ),
+
+    filtered.length===0
+      ? e('div',{style:{textAlign:'center',padding:'32px',color:'var(--muted)',fontSize:14}},'No notifications yet')
+      : filtered.map(n=>
+          e('div',{key:n.id,onClick:()=>setNotifs(p=>p.map(x=>x.id===n.id?{...x,read:true}:x)),style:{...css.card,marginBottom:10,cursor:'pointer',opacity:n.read?.6:1,display:'flex',gap:12,alignItems:'center',border:`1px solid ${n.read?'var(--border)':n.color+'40'}`}},
+            e('div',{style:{width:38,height:38,borderRadius:10,background:`${n.color}20`,display:'flex',alignItems:'center',justifyContent:'center',fontSize:20,flexShrink:0}},n.icon),
+            e('div',{style:{flex:1,minWidth:0}},
+              e('div',{style:{fontWeight:700,fontSize:13,display:'flex',gap:6,alignItems:'center'}},n.title,n.live&&e('span',{style:{...css.badge('var(--green)'),fontSize:9,padding:'1px 6px'}},'LIVE')),
+              e('div',{style:{fontSize:12,color:'var(--muted)',marginTop:2,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}},n.body)
+            ),
+            e('div',{style:{fontSize:11,color:'var(--dim)',flexShrink:0}},n.time),
+            !n.read && e('div',{style:{width:8,height:8,borderRadius:'50%',background:n.color,flexShrink:0}})
+          )
+        )
+  );
+}
+
+// ─── Contractor Dashboard ─────────────────────────────────────────────────────
+function DashboardTab({ws}) {
+  const [tab, setTab] = useState('overview');
+  const [leads, setLeads] = useState([]);
+  const [newLeadCount, setNewLeadCount] = useState(0);
+
+  useEffect(()=>{
+    api('/api/bookings?role=contractor&userId=1').then(rows=>{
+      setLeads(rows);
+    }).catch(()=>{});
+  },[]);
+
+  // Real-time new leads
+  useEffect(()=>{
+    return ws.on('new_lead', msg=>{
+      setLeads(p=>[msg.booking,...p]);
+      setNewLeadCount(n=>n+1);
+    });
+  },[ws]);
+
+  useEffect(()=>{
+    return ws.on('booking_paid', msg=>{
+      setLeads(p=>p.map(l=>l.id===msg.bookingId?{...l,status:'paid'}:l));
+    });
+  },[ws]);
+
+  const bars = [480,720,340,890,560,740,1100,480,650,910,380,760,1050,590];
+
+  return e('div',null,
+    // Header
+    e('div',{style:{...css.card,marginBottom:14,display:'flex',gap:14,alignItems:'center'}},
+      e('div',{style:{width:50,height:50,borderRadius:14,background:'var(--grad)',display:'flex',alignItems:'center',justifyContent:'center',fontWeight:800,fontSize:16}},'MP'),
+      e('div',{style:{flex:1}},
+        e('div',{style:{fontWeight:800,fontSize:15}},'Martinez Pro Plumbing'),
+        e('div',{style:{fontSize:12,color:'var(--muted)'}},'★ 4.9 · ',ws.connected?e('span',{style:{color:'var(--green)'}},'● Live Dashboard'):e('span',{style:{color:'var(--yellow)'}},'● Reconnecting'))
+      ),
+      newLeadCount>0 && e('span',{style:css.badge('var(--accent)')},'+',newLeadCount,' new')
+    ),
+
+    // Stats
+    e('div',{style:{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10,marginBottom:14}},
+      ...['📥 Leads','✅ Jobs','💰 Earned','⭐ Rating'].map((s,i)=>{
+        const vals=[leads.length||4,47,'$12.8k',4.9];
+        const cols=['var(--accent)','var(--green)','var(--blue)','var(--yellow)'];
+        return e('div',{key:s,style:{...css.card,textAlign:'center',padding:14}},
+          e('div',{style:{fontSize:20,marginBottom:4}},s.split(' ')[0]),
+          e('div',{style:{fontWeight:800,fontSize:22,color:cols[i]}},vals[i]),
+          e('div',{style:{fontSize:11,color:'var(--muted)'}},s.split(' ')[1])
+        );
+      })
+    ),
+
+    // Subtabs
+    e('div',{style:{display:'flex',background:'var(--surface)',borderRadius:10,padding:3,marginBottom:14,gap:2}},
+      ['overview','leads','payouts'].map(t=>e('button',{key:t,onClick:()=>setTab(t),style:{flex:1,padding:'8px 2px',borderRadius:8,border:'none',fontSize:11,fontWeight:700,cursor:'pointer',fontFamily:'inherit',background:t===tab?'var(--accent)':'transparent',color:t===tab?'#fff':'var(--muted)',textTransform:'capitalize',transition:'all .2s'}},t))
+    ),
+
+    tab==='overview' && e('div',null,
+      e('div',{style:{...css.card,marginBottom:12}},
+        e('div',{style:{fontSize:10,color:'var(--muted)',fontWeight:700,letterSpacing:1,marginBottom:10}},'REVENUE — 14 DAYS'),
+        e('div',{style:{display:'flex',alignItems:'flex-end',gap:5,height:72}},
+          bars.map((v,i)=>e('div',{key:i,style:{flex:1,background:i===13?'var(--accent)':`rgba(249,115,22,${.2+v/1800})`,borderRadius:'3px 3px 0 0',height:(v/1100*100)+'%',minWidth:0}}))
+        ),
+        e('div',{style:{display:'flex',justifyContent:'space-between',marginTop:6,fontSize:12}},
+          e('span',{style:{color:'var(--muted)'}},'14d ago'),
+          e('span',{style:{fontWeight:700,color:'var(--accent)'}},'Today: $590'),
+          e('span',{style:{color:'var(--green)'}},'↑12%')
+        )
+      ),
+      [
+        {icon:'📥',text:'New booking received · '+leads.length+' total',time:'live',col:'var(--accent)'},
+        {icon:'✅',text:'Job completed: Water heater install',time:'Yesterday',col:'var(--green)'},
+        {icon:'⭐',text:'5-star review from Alex J.',time:'2d ago',col:'var(--yellow)'},
+        {icon:'💳',text:'Stripe payout: $340 deposited',time:'3d ago',col:'var(--blue)'},
+      ].map((a,i)=>e('div',{key:i,style:{...css.card,marginBottom:10,display:'flex',gap:12,alignItems:'center'}},
+        e('div',{style:{width:38,height:38,borderRadius:10,background:`${a.col}20`,display:'flex',alignItems:'center',justifyContent:'center',fontSize:18,flexShrink:0}},a.icon),
+        e('div',{style:{flex:1,fontSize:13}},a.text),
+        e('div',{style:{fontSize:11,color:'var(--dim)',flexShrink:0}},a.time)
+      ))
+    ),
+
+    tab==='leads' && e('div',null,
+      leads.length===0
+        ? e('div',{style:{textAlign:'center',padding:'32px',color:'var(--muted)'}},'No bookings yet. Book a job in the Homeowner tab!')
+        : leads.map(l=>e('div',{key:l.id,style:{...css.card,marginBottom:12}},
+            e('div',{style:{display:'flex',justifyContent:'space-between',alignItems:'flex-start',marginBottom:10}},
+              e('div',null,
+                e('div',{style:{fontWeight:700,fontSize:14}},'Booking #',l.id,' · ',l.category),
+                e('div',{style:{fontSize:12,color:'var(--muted)',marginTop:3}},l.description?.slice(0,60)||'No description')
+              ),
+              e('span',{style:css.badge(l.status==='paid'?'var(--green)':l.status==='pending'?'var(--accent)':'var(--muted)')},l.status)
+            ),
+            e('div',{style:{display:'flex',justifyContent:'space-between',alignItems:'center',paddingTop:10,borderTop:'1px solid var(--border)'}},
+              e('span',{style:{fontWeight:700,color:'var(--green)',fontSize:14}},'Est. $',l.est_price),
+              e('div',{style:{display:'flex',gap:8}},
+                e('button',{style:{...css.btn('ghost'),fontSize:12}},'Pass'),
+                e('button',{style:{...css.btn('sm'),background:'var(--grad)'}},'View →')
+              )
+            )
+          ))
+    ),
+
+    tab==='payouts' && e('div',null,
+      e('div',{style:{...css.card,marginBottom:12,border:'1px solid rgba(16,185,129,.3)'}},
+        e('div',{style:{fontSize:10,color:'var(--muted)',fontWeight:700,marginBottom:8}},'STRIPE CONNECT'),
+        ...['Account type|Express','Charges enabled|✓ Yes','Platform fee|$9.99/booking','Payout schedule|Daily rolling','Net rate|~97% after fees'].map(s=>
+          e('div',{key:s,style:{display:'flex',justifyContent:'space-between',padding:'8px 0',borderBottom:'1px solid var(--border)',fontSize:13}},
+            e('span',{style:{color:'var(--muted)'}},s.split('|')[0]),
+            e('span',{style:{fontWeight:600,color:s.includes('✓')?'var(--green)':'var(--text)'}},s.split('|')[1])
+          )
+        )
+      ),
+      [['Mar 28','$340','2 jobs'],['Mar 27','$850','1 job'],['Mar 26','$620','3 jobs']].map(([d,a,j])=>
+        e('div',{key:d,style:{...css.card,marginBottom:10,display:'flex',justifyContent:'space-between',alignItems:'center'}},
+          e('div',null,e('div',{style:{fontWeight:700}},d),e('div',{style:{fontSize:12,color:'var(--muted)'}},j)),
+          e('div',{style:{textAlign:'right'}},e('div',{style:{fontWeight:800,fontSize:16,color:'var(--green)'}},a),e('div',{style:{fontSize:10,color:'var(--dim)'}},'Deposited'))
+        )
+      )
+    )
+  );
+}
+
+// ─── ROOT ─────────────────────────────────────────────────────────────────────
+function App() {
+  const [tab, setTab] = useState('homeowner');
+  const ws = useWS('4'); // homeowner user id
+  const [apiStatus, setApiStatus] = useState('checking');
+
+  useEffect(()=>{
+    fetch(API+'/api/health').then(r=>r.json()).then(()=>setApiStatus('online')).catch(()=>setApiStatus('offline'));
+  },[]);
+
+  return e('div',{style:{minHeight:'100vh',background:'var(--bg)',color:'var(--text)',fontFamily:"'DM Sans',system-ui,sans-serif"}},
+    // Header
+    e('header',{style:{padding:'16px 20px 0',display:'flex',alignItems:'center',justifyContent:'space-between',maxWidth:500,margin:'0 auto'}},
+      e('div',{style:{display:'flex',alignItems:'center',gap:10}},
+        e('div',{style:{width:32,height:32,borderRadius:9,background:'var(--grad)',display:'flex',alignItems:'center',justifyContent:'center',fontSize:16}},'🔩'),
+        e('span',{style:{fontSize:20,fontWeight:800,letterSpacing:-.5}},'Fix',e('span',{style:{color:'var(--accent)'}},'It'))
+      ),
+      e('div',{style:{display:'flex',gap:8,alignItems:'center'}},
+        e('div',{style:{fontSize:10,color:apiStatus==='online'?'var(--green)':apiStatus==='offline'?'var(--red)':'var(--yellow)',fontWeight:700}},
+          apiStatus==='online'?'● API Live':apiStatus==='offline'?'● API Offline':'● Checking...'
+        ),
+        ws.connected && e('div',{style:{fontSize:10,color:'var(--green)',fontWeight:700}},'● WS Live')
+      )
+    ),
+
+    // Nav
+    e('nav',{style:{maxWidth:500,margin:'14px auto 0',padding:'0 20px'}},
+      e('div',{style:{display:'flex',background:'var(--surface)',borderRadius:14,padding:4,gap:2}},
+        TABS.map(t=>e('button',{key:t.id,onClick:()=>setTab(t.id),style:{flex:1,padding:'9px 2px',borderRadius:10,border:'none',fontSize:11,fontWeight:700,cursor:'pointer',fontFamily:'inherit',background:t.id===tab?'var(--grad)':'transparent',color:t.id===tab?'#fff':'var(--muted)',transition:'all .2s',display:'flex',flexDirection:'column',alignItems:'center',gap:2}},
+          e('span',{style:{fontSize:16}},t.label),
+          e('span',null,t.name)
+        ))
+      )
+    ),
+
+    // Content
+    e('main',{style:{maxWidth:500,margin:'16px auto 0',padding:'0 20px 60px'}},
+      tab==='homeowner' && e(HomeownerTab,{ws}),
+      tab==='chat'      && e(ChatTab,{ws}),
+      tab==='map'       && e(MapTab,{}),
+      tab==='push'      && e(PushTab,{ws}),
+      tab==='dashboard' && e(DashboardTab,{ws})
+    )
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(e(App));
+</script>
+</body>
+</html>
