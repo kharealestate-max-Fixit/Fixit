@@ -318,6 +318,17 @@ def index(handler, match, qs, body):
     handler.end_headers()
     handler.wfile.write(body)
 
+@route("GET", r"/icon.png")
+def serve_icon(handler, match, qs, body):
+    import os
+    path = os.path.join(os.path.dirname(__file__), "..", "public", "icon.png")
+    with open(path, "rb") as f: data = f.read()
+    handler.send_response(200)
+    handler.send_header("Content-Type", "image/png")
+    handler.send_header("Content-Length", str(len(data)))
+    handler.end_headers()
+    handler.wfile.write(data)
+
 @route("GET", r"/api/health")
 def health(handler, match, qs, body):
     json_response(handler, {"status":"ok","time":time.time(),"ws_users":len(ws_clients)})
