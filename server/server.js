@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
 import { pool, query, one, all, initDb } from './db.js';
 import {
-  stripe, stripeEnabled, STRIPE_WEBHOOK_SECRET, PUBLIC_URL, PLATFORM_FEE_CENTS,
+  stripe, stripeEnabled, STRIPE_WEBHOOK_SECRET, STRIPE_PUBLISHABLE_KEY, PUBLIC_URL, PLATFORM_FEE_CENTS,
 } from './stripe.js';
 import { VAPID_PUBLIC_KEY, sendPush } from './push.js';
 import { hashPassword, verifyPassword, signToken, verifyToken, authRequired, authOptional } from './auth.js';
@@ -371,6 +371,33 @@ app.post('/api/payments/create-intent', h(async (req, res) => {
     clientSecret: fakeSecret, simulated: true,
     note: 'Set STRIPE_SECRET_KEY env var for real payments',
   });
+}));
+
+// Frontend asks this to decide between the real Stripe card form and the demo flow.
+app.get('/api/payments/config', (req, res) => {
+  res.json({
+    enabled: stripeEnabled() && Boolean(STRIPE_PUBLISHABLE_KEY),
+    publishableKey: STRIPE_PUBLISHABLE_KEY,
+  });
+});
+
+// Called after the browser confirms a card payment — verifies the PaymentIntent
+// with Stripe and marks the booking paid (so we don't depend on the webhook).
+app.post('/api/payments/confirm', authOptional, h(async (req, res) => {
+  const bookingId = req.body?.bookingId;
+  const booking = await one('SELECT * FROM bookings WHERE id=$1', [bookingId]);
+  if (!booking) return res.status(404).json({ error: 'booking not found' });
+  if (booking.status === 'paid') return res.json({ status: 'paid' });
+
+  if (stripeEnabled() && booking.stripe_intent) {
+    const intent = await stripe.paymentIntents.retrieve(booking.stripe_intent);
+    if (intent.status === 'succeeded') {
+      await confirmBookingPaid(bookingId, intent.amount);
+      return res.json({ status: 'paid' });
+    }
+    return res.json({ status: intent.status });
+  }
+  res.json({ status: booking.status });
 }));
 
 // ─── Stripe Connect onboarding (contractors get paid out) ─────────────────────

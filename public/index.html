@@ -35,6 +35,7 @@ window.process = {env:{NODE_ENV:'production'}};
 </script>
 <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
 <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://js.stripe.com/v3/"></script>
 
 <script>
 const { useState, useEffect, useRef, useCallback, useMemo } = React;
@@ -173,6 +174,56 @@ const TABS = [
 ];
 
 // ─── Homeowner booking flow ───────────────────────────────────────────────────
+// ─── Real Stripe card checkout (Stripe.js Elements) ───────────────────────────
+function StripeCardForm({publishableKey, amount, booking, selected, onSuccess, onBack}) {
+  const mountRef = useRef();
+  const stripeRef = useRef(null);
+  const cardRef = useRef(null);
+  const [ready, setReady] = useState(false);
+  const [processing, setProcessing] = useState(false);
+  const [err, setErr] = useState('');
+
+  useEffect(()=>{
+    if(!window.Stripe || !publishableKey){ setErr('Stripe failed to load'); return; }
+    const stripe = window.Stripe(publishableKey);
+    const elements = stripe.elements();
+    const card = elements.create('card',{style:{base:{color:'#fafafa',fontFamily:'DM Sans, system-ui, sans-serif',fontSize:'15px','::placeholder':{color:'#71717a'}},invalid:{color:'#ef4444'}}});
+    stripeRef.current = stripe; cardRef.current = card;
+    const t = setTimeout(()=>{ if(mountRef.current){ card.mount(mountRef.current); setReady(true); } },0);
+    return ()=>{ clearTimeout(t); try{ card.unmount(); }catch{} };
+  },[publishableKey]);
+
+  const pay = async ()=>{
+    setErr(''); setProcessing(true);
+    try {
+      const intent = await api('/api/payments/create-intent',{method:'POST',body:{contractorId:selected.id,bookingId:booking.id,amount}});
+      if(!intent.clientSecret) throw new Error(intent.error||'Could not start payment');
+      const res = await stripeRef.current.confirmCardPayment(intent.clientSecret,{payment_method:{card:cardRef.current}});
+      if(res.error) throw new Error(res.error.message);
+      if(res.paymentIntent && res.paymentIntent.status==='succeeded'){
+        await api('/api/payments/confirm',{method:'POST',body:{bookingId:booking.id}});
+        onSuccess();
+      } else throw new Error('Payment was not completed');
+    } catch(ex){ setErr(ex.message||'Payment failed'); setProcessing(false); }
+  };
+
+  return e('div',null,
+    e('div',{style:{...css.card,marginBottom:14}},
+      e('label',{style:css.label},'Card details'),
+      e('div',{ref:mountRef, style:{...css.input, padding:'13px 14px'}}),
+      e('p',{style:{fontSize:11,color:'var(--dim)',marginTop:8}},'Test card: 4242 4242 4242 4242 · any future expiry · any CVC · any ZIP')
+    ),
+    err && e('div',{style:{background:'rgba(239,68,68,.12)',color:'var(--red)',fontSize:12,padding:'9px 12px',borderRadius:8,marginBottom:12}},err),
+    processing
+      ? e('div',{style:{textAlign:'center',padding:'20px 0'}},
+          e('div',{style:{width:46,height:46,borderRadius:'50%',border:'3px solid var(--accent)',borderTop:'3px solid transparent',margin:'0 auto 12px',animation:'spin .8s linear infinite'}}),
+          e('p',{style:{color:'var(--accent)',fontWeight:700}},'Charging card…'))
+      : e('div',{style:{display:'flex',gap:8}},
+          e('button',{style:{...css.btn('ghost'),flex:'0 0 44px'},onClick:onBack},'←'),
+          e('button',{style:{...css.btn(),flex:1,opacity:ready?1:.5},disabled:!ready,onClick:pay},'Pay $'+((amount/100).toFixed(2))+' →'))
+  );
+}
+
 function HomeownerTab({ws}) {
   const [step, setStep] = useState('capture');
   const [category, setCategory] = useState('');
@@ -184,6 +235,7 @@ function HomeownerTab({ws}) {
   const [loading, setLoading] = useState(false);
   const [progress, setProgress] = useState(0);
   const [payStep, setPayStep] = useState('form');
+  const [payCfg, setPayCfg] = useState(null);
   const [cardNum, setCardNum] = useState('4242 4242 4242 4242');
   const [expiry, setExpiry] = useState('12/27');
   const [cvv, setCvv] = useState('···');
@@ -196,6 +248,11 @@ function HomeownerTab({ws}) {
   useEffect(()=>{
     api('/api/stats').then(setLiveStats).catch(()=>{});
   },[step]);
+
+  // Is real Stripe checkout available?
+  useEffect(()=>{
+    api('/api/payments/config').then(setPayCfg).catch(()=>setPayCfg({enabled:false}));
+  },[]);
 
   // Listen for WS events
   useEffect(()=>{
@@ -268,7 +325,9 @@ function HomeownerTab({ws}) {
         )
       )
     ),
-    payStep==='processing'
+    (payCfg && payCfg.enabled)
+      ? e(StripeCardForm,{publishableKey:payCfg.publishableKey, amount:Math.round((selected.base_price+9.99)*100), booking, selected, onSuccess:()=>setStep('confirmed'), onBack:()=>setStep('results')})
+    : payStep==='processing'
       ? e('div',{style:{textAlign:'center',padding:'32px 0'}},
           e('div',{style:{width:52,height:52,borderRadius:'50%',border:'3px solid var(--accent)',borderTop:'3px solid transparent',margin:'0 auto 16px',animation:'spin .8s linear infinite'}}),
           e('p',{style:{color:'var(--accent)',fontWeight:700}},'Processing payment...'))

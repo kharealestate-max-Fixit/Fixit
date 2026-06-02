@@ -8,6 +8,8 @@ import Stripe from 'stripe';
 const SECRET = (process.env.STRIPE_SECRET_KEY || '').trim();
 const SECRET_VALID = SECRET.startsWith('sk_');
 export const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || '';
+// Publishable key — safe to expose to the browser for Stripe.js / Elements.
+export const STRIPE_PUBLISHABLE_KEY = (process.env.STRIPE_PUBLISHABLE_KEY || '').trim();
 
 // Public origin used to build Connect onboarding return/refresh URLs.
 // RENDER_EXTERNAL_URL is auto-set when deployed on Render.
