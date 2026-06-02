@@ -3,7 +3,10 @@
 // the simulated payment path — so the app runs end-to-end with zero config.
 import Stripe from 'stripe';
 
-const SECRET = process.env.STRIPE_SECRET_KEY || '';
+// Only treat it as a real key if it looks like one — guards against a blank or
+// placeholder value accidentally enabling (and breaking) live payments.
+const SECRET = (process.env.STRIPE_SECRET_KEY || '').trim();
+const SECRET_VALID = SECRET.startsWith('sk_');
 export const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || '';
 
 // Public origin used to build Connect onboarding return/refresh URLs.
@@ -16,7 +19,7 @@ export const PUBLIC_URL =
 // Platform fee taken per booking, in cents ($9.99). Matches the homeowner fee.
 export const PLATFORM_FEE_CENTS = parseInt(process.env.PLATFORM_FEE_CENTS || '999', 10);
 
-export const stripe = SECRET
+export const stripe = SECRET_VALID
   ? new Stripe(SECRET, { apiVersion: '2024-06-20' })
   : null;
 

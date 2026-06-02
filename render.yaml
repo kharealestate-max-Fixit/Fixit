@@ -18,13 +18,9 @@ services:
           property: connectionString
       - key: NODE_VERSION
         value: "22.12.0"
-      # Optional — add in the Render dashboard to go fully live:
-      - key: ANTHROPIC_API_KEY
-        sync: false
-      - key: STRIPE_SECRET_KEY
-        sync: false
-      - key: STRIPE_WEBHOOK_SECRET
-        sync: false
+      # To go fully live later, add these in the Render dashboard
+      # (service → Environment): ANTHROPIC_API_KEY, STRIPE_SECRET_KEY,
+      # STRIPE_WEBHOOK_SECRET. Left out here so deploy needs no input.
 
 databases:
   - name: fixit-db
