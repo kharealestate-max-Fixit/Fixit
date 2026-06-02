@@ -12,6 +12,7 @@ import {
 } from './stripe.js';
 import { VAPID_PUBLIC_KEY, sendPush } from './push.js';
 import { hashPassword, verifyPassword, signToken, verifyToken, authRequired, authOptional } from './auth.js';
+import { analyzeIssue, activeProvider } from './vision.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, '..', 'public');
@@ -526,50 +527,27 @@ app.post('/api/push/subscribe', authOptional, h(async (req, res) => {
   res.json({ success: true });
 }));
 
-// ─── AI analysis (calls Claude if key set, else returns mock) ─────────────────
+// ─── AI photo analysis (Gemini / Claude / mock) ───────────────────────────────
+// Tells the frontend which provider is active (so it can label "AI" vs "demo").
+app.get('/api/analyze/config', (req, res) => {
+  res.json({ provider: activeProvider() });
+});
+
 app.post('/api/analyze', h(async (req, res) => {
   const b = req.body || {};
   const category = b.category || 'General';
   const description = b.description || '';
 
-  if (ANTHROPIC_KEY) {
-    const prompt = `You are a home repair AI. Category: ${category}. Description: "${description}"
-Return ONLY valid JSON (no markdown):
-{"issue":"short title","severity":"Low|Moderate|High|Emergency","description":"2 sentence diagnosis","estimateLow":120,"estimateHigh":280,"timeHours":"1-3","diyDifficulty":"Easy|Moderate|Hard|Professional Only","urgency":"Schedule soon|This week|Today|Emergency","tips":["tip1","tip2"]}`;
-    try {
-      const resp = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: {
-          'x-api-key': ANTHROPIC_KEY,
-          'anthropic-version': '2023-06-01',
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          model: 'claude-sonnet-4-20250514',
-          max_tokens: 512,
-          messages: [{ role: 'user', content: prompt }],
-        }),
-        signal: AbortSignal.timeout(15000),
-      });
-      const data = await resp.json();
-      const text = (data.content || []).map((blk) => blk.text || '').join('');
-      return res.json(JSON.parse(text.trim()));
-    } catch (e) {
-      log(C.R, 'AI', String(e.message || e));
-    }
+  // Accept an image as a data URL ("data:image/jpeg;base64,...") or raw base64.
+  let image = null;
+  if (b.image && typeof b.image === 'string') {
+    const m = b.image.match(/^data:([^;]+);base64,(.*)$/);
+    if (m) image = { mediaType: m[1], data: m[2] };
+    else image = { mediaType: 'image/jpeg', data: b.image };
   }
 
-  // Fallback mock
-  res.json({
-    issue: `${category} Issue Detected`,
-    severity: 'Moderate',
-    description: `AI analysis of your ${category.toLowerCase()} issue. Based on typical cases, this appears to be a standard repair requiring a licensed professional.`,
-    estimateLow: 120, estimateHigh: 280,
-    timeHours: '1–3', diyDifficulty: 'Moderate',
-    urgency: 'This week',
-    tips: ['Turn off water/power if needed', 'Document with photos before repair'],
-    simulated: true,
-  });
+  const result = await analyzeIssue({ category, description, image });
+  res.json(result);
 }));
 
 // ─── Stats ────────────────────────────────────────────────────────────────────
@@ -644,7 +622,8 @@ async function main() {
     log(C.B, 'API', `Health: http://localhost:${PORT}/api/health`);
     log(C.B, 'API', `Contractors: http://localhost:${PORT}/api/contractors/nearby?lat=34.052&lng=-118.248`);
     log(C.Y, 'WS', `WebSocket: ws://localhost:${PORT}?userId=1`);
-    log(ANTHROPIC_KEY ? C.M : C.Y, 'AI', ANTHROPIC_KEY ? 'Claude AI: ENABLED' : 'Claude AI: set ANTHROPIC_API_KEY for real analysis (mock mode active)');
+    const prov = activeProvider();
+    log(prov !== 'mock' ? C.M : C.Y, 'AI', prov === 'gemini' ? 'Vision AI: Google Gemini' : prov === 'claude' ? 'Vision AI: Anthropic Claude' : 'Vision AI: mock (set GEMINI_API_KEY or ANTHROPIC_API_KEY)');
     log(stripeEnabled() ? C.M : C.Y, 'PAY', stripeEnabled() ? 'Stripe: LIVE (real payments + Connect)' : 'Stripe: simulated (set STRIPE_SECRET_KEY)');
     log(C.W, '---', 'Press Ctrl+C to stop\n');
   });

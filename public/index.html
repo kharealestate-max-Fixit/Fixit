@@ -174,6 +174,29 @@ const TABS = [
 ];
 
 // ─── Homeowner booking flow ───────────────────────────────────────────────────
+// Resize an image file to a max dimension and return a JPEG data URL (keeps
+// uploads small + cheap for the vision API).
+function resizeToDataURL(file, maxDim=1024, quality=0.8) {
+  return new Promise((resolve, reject)=>{
+    const reader = new FileReader();
+    reader.onerror = reject;
+    reader.onload = ev => {
+      const img = new Image();
+      img.onerror = reject;
+      img.onload = () => {
+        const scale = Math.min(1, maxDim/Math.max(img.width, img.height));
+        const w = Math.round(img.width*scale), h = Math.round(img.height*scale);
+        const canvas = document.createElement('canvas');
+        canvas.width = w; canvas.height = h;
+        canvas.getContext('2d').drawImage(img, 0, 0, w, h);
+        resolve(canvas.toDataURL('image/jpeg', quality));
+      };
+      img.src = ev.target.result;
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
 // ─── Real Stripe card checkout (Stripe.js Elements) ───────────────────────────
 function StripeCardForm({publishableKey, amount, booking, selected, onSuccess, onBack}) {
   const mountRef = useRef();
@@ -236,6 +259,7 @@ function HomeownerTab({ws}) {
   const [progress, setProgress] = useState(0);
   const [payStep, setPayStep] = useState('form');
   const [payCfg, setPayCfg] = useState(null);
+  const [photo, setPhoto] = useState(null);
   const [cardNum, setCardNum] = useState('4242 4242 4242 4242');
   const [expiry, setExpiry] = useState('12/27');
   const [cvv, setCvv] = useState('···');
@@ -261,16 +285,22 @@ function HomeownerTab({ws}) {
     });
   },[ws, booking]);
 
+  const onPhoto = async (file) => {
+    if(!file) return;
+    try { setPhoto(await resizeToDataURL(file)); } catch(e){ console.warn('photo error', e); }
+  };
+
   const analyze = async () => {
-    if(!category && !description) return;
+    if(!category && !description && !photo) return;
     setLoading(true); setStep('analyzing'); setProgress(0);
     const iv = setInterval(()=>setProgress(p=>Math.min(p+9,90)),200);
     try {
-      const r = await api('/api/analyze',{method:'POST',body:{category:category.replace(/^\S+ /,''), description}});
+      const r = await api('/api/analyze',{method:'POST',body:{category:category.replace(/^\S+ /,''), description, image:photo}});
       setAnalysis(r);
       clearInterval(iv); setProgress(100);
       setTimeout(async ()=>{
-        const r2 = await api(`/api/contractors/nearby?lat=34.052&lng=-118.248&radius=10&category=${encodeURIComponent(category.replace(/^\S+ /,''))}`);
+        const useCat = category.replace(/^\S+ /,'') || (r.recommendedCategory||'');
+        const r2 = await api(`/api/contractors/nearby?lat=34.052&lng=-118.248&radius=10&category=${encodeURIComponent(useCat)}`);
         setContractors(r2.contractors||[]);
         setLoading(false); setStep('results');
       }, 500);
@@ -302,7 +332,7 @@ function HomeownerTab({ws}) {
         )
       )
     ),
-    e('button',{style:{...css.btn(),width:'100%'},onClick:()=>{setStep('capture');setCategory('');setDescription('');setAnalysis(null);setSelected(null);setBooking(null);setPayStep('form')}},'Book Another Repair')
+    e('button',{style:{...css.btn(),width:'100%'},onClick:()=>{setStep('capture');setCategory('');setDescription('');setAnalysis(null);setSelected(null);setBooking(null);setPayStep('form');setPhoto(null)}},'Book Another Repair')
   );
 
   if(step==='pay') return e('div',null,
@@ -362,19 +392,31 @@ function HomeownerTab({ws}) {
     e('div',{style:{...css.card,marginBottom:14,border:`1px solid ${sevColor[analysis.severity]||'var(--border)'}40`}},
       e('div',{style:{display:'flex',justifyContent:'space-between',alignItems:'flex-start',marginBottom:10}},
         e('div',null,
-          e('div',{style:{fontSize:10,color:'var(--muted)',fontWeight:700,marginBottom:4}},'🤖 AI DIAGNOSIS'+(analysis.simulated?' (MOCK — add ANTHROPIC_API_KEY)':' (LIVE)')),
+          e('div',{style:{fontSize:10,color:'var(--muted)',fontWeight:700,marginBottom:4}},'🤖 AI DIAGNOSIS · '+(analysis.provider==='gemini'?'Gemini Vision':analysis.provider==='claude'?'Claude Vision':'demo mode')),
           e('div',{style:{fontWeight:800,fontSize:17}},analysis.issue),
-          e('span',{style:css.badge(sevColor[analysis.severity]||'var(--accent)')},analysis.severity,' · ',analysis.urgency)
+          e('span',{style:css.badge(sevColor[analysis.severity]||'var(--accent)')},analysis.severity)
         ),
-        e('div',{style:{textAlign:'right'}},
+        (analysis.options&&analysis.options.length) && e('div',{style:{textAlign:'right'}},
           e('div',{style:{fontSize:11,color:'var(--muted)'}},'Est. Cost'),
-          e('div',{style:{fontWeight:800,fontSize:20,color:'var(--accent)'}},'$',analysis.estimateLow,'–$',analysis.estimateHigh)
+          e('div',{style:{fontWeight:800,fontSize:20,color:'var(--accent)'}},'$',Math.min(...analysis.options.map(o=>o.estimateLow||0)),'–$',Math.max(...analysis.options.map(o=>o.estimateHigh||0)))
         )
       ),
-      e('p',{style:{fontSize:13,color:'#a0a0b0',lineHeight:1.5,margin:'10px 0'}},analysis.description),
+      e('p',{style:{fontSize:13,color:'#a0a0b0',lineHeight:1.5,margin:'10px 0'}},analysis.summary||analysis.description),
       analysis.tips?.length && e('div',{style:{borderTop:'1px solid var(--border)',paddingTop:10,marginTop:8}},
         analysis.tips.map((t,i)=>e('div',{key:i,style:{fontSize:12,color:'var(--muted)',marginTop:4}},'💡 ',t))
       )
+    ),
+    (analysis.options&&analysis.options.length) && e('div',{style:{marginBottom:16}},
+      e('label',{style:{...css.label,marginBottom:8}},'Your repair options'),
+      analysis.options.map((o,i)=>e('div',{key:i,style:{...css.card,marginBottom:8,padding:14}},
+        e('div',{style:{display:'flex',justifyContent:'space-between',alignItems:'baseline',gap:8}},
+          e('div',{style:{fontWeight:700,fontSize:14}},o.title),
+          e('div',{style:{fontWeight:800,fontSize:14,color:'var(--accent)',whiteSpace:'nowrap'}},'$'+o.estimateLow+'–$'+o.estimateHigh)),
+        o.description && e('div',{style:{fontSize:12,color:'var(--muted)',margin:'5px 0',lineHeight:1.4}},o.description),
+        e('div',{style:{display:'flex',gap:12,fontSize:11,color:'var(--dim)',marginTop:4}},
+          o.difficulty&&e('span',null,'🛠 ',o.difficulty),
+          o.time&&e('span',null,'⏱ ',o.time))
+      ))
     ),
     e('h3',{style:{fontWeight:800,fontSize:17,marginBottom:12}},contractors.length,' Contractors Found'),
     contractors.map((c,i)=>
@@ -426,10 +468,21 @@ function HomeownerTab({ws}) {
       ))
     ),
 
+    e('label',{style:css.label},'Photo of the issue'),
+    e('input',{type:'file',accept:'image/*',capture:'environment',id:'photoInput',style:{display:'none'},onChange:ev=>onPhoto(ev.target.files&&ev.target.files[0])}),
+    photo
+      ? e('div',{style:{position:'relative',marginBottom:16}},
+          e('img',{src:photo,style:{width:'100%',borderRadius:12,maxHeight:240,objectFit:'cover',border:'1px solid var(--border)',display:'block'}}),
+          e('button',{onClick:()=>setPhoto(null),style:{position:'absolute',top:8,right:8,...css.btn('xs'),background:'rgba(0,0,0,.65)',color:'#fff',outline:'none'}},'✕ Remove'))
+      : e('label',{htmlFor:'photoInput',style:{...css.card,borderStyle:'dashed',display:'flex',flexDirection:'column',alignItems:'center',gap:6,padding:'26px 16px',cursor:'pointer',marginBottom:16}},
+          e('div',{style:{fontSize:30}},'📸'),
+          e('div',{style:{fontWeight:700,fontSize:14}},'Add a photo'),
+          e('div',{style:{fontSize:12,color:'var(--muted)',textAlign:'center'}},'Take or upload a picture — our AI will diagnose it')),
+
     e('label',{style:css.label},'Describe the issue'),
     e('textarea',{style:{...css.input,resize:'none',marginBottom:16,lineHeight:1.5},rows:3,placeholder:"E.g. 'Leaking pipe under kitchen sink, water pooling on floor'",value:description,onChange:ev=>setDescription(ev.target.value)}),
 
-    e('button',{style:{...css.btn(),width:'100%',opacity:category||description?1:.4},onClick:analyze},'🤖 Analyze & Find Contractors →'),
+    e('button',{style:{...css.btn(),width:'100%',opacity:(category||description||photo)?1:.4},onClick:analyze},'🤖 Analyze & Find Contractors →'),
     e('p',{style:{textAlign:'center',fontSize:11,color:'var(--dim)',marginTop:10}},'Backend: ',API,' · PostgreSQL DB active')
   );
 }
