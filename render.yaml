@@ -1,0 +1,31 @@
+# Render Blueprint — one-click deploy of FixIt (web service + managed Postgres).
+# Deploy: push this repo to GitHub, then at https://dashboard.render.com
+# choose "New +" → "Blueprint" → pick this repo. Render reads this file.
+services:
+  - type: web
+    name: fixit
+    runtime: node
+    plan: free
+    rootDir: server
+    buildCommand: npm install --omit=dev
+    startCommand: npm start
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: fixit-db
+          property: connectionString
+      - key: NODE_VERSION
+        value: "22.12.0"
+      # Optional — add in the Render dashboard to go fully live:
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: STRIPE_SECRET_KEY
+        sync: false
+      - key: STRIPE_WEBHOOK_SECRET
+        sync: false
+
+databases:
+  - name: fixit-db
+    plan: free

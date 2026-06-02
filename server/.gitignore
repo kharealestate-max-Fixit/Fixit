@@ -1,0 +1,6 @@
+node_modules/
+.pgdata/
+.env
+.vapid.json
+db/*.db-shm
+db/*.db-wal

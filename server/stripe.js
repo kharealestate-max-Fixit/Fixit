@@ -1,0 +1,23 @@
+// FixIt — Stripe client + helpers (real payments via Stripe Connect)
+// When STRIPE_SECRET_KEY is unset, `stripe` is null and callers fall back to
+// the simulated payment path — so the app runs end-to-end with zero config.
+import Stripe from 'stripe';
+
+const SECRET = process.env.STRIPE_SECRET_KEY || '';
+export const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || '';
+
+// Public origin used to build Connect onboarding return/refresh URLs.
+// RENDER_EXTERNAL_URL is auto-set when deployed on Render.
+export const PUBLIC_URL =
+  process.env.PUBLIC_URL ||
+  process.env.RENDER_EXTERNAL_URL ||
+  `http://localhost:${process.env.PORT || 3001}`;
+
+// Platform fee taken per booking, in cents ($9.99). Matches the homeowner fee.
+export const PLATFORM_FEE_CENTS = parseInt(process.env.PLATFORM_FEE_CENTS || '999', 10);
+
+export const stripe = SECRET
+  ? new Stripe(SECRET, { apiVersion: '2024-06-20' })
+  : null;
+
+export const stripeEnabled = () => stripe !== null;

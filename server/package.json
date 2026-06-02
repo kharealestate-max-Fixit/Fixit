@@ -1,0 +1,26 @@
+{
+  "name": "fixit-backend",
+  "version": "2.0.0",
+  "description": "FixIt — AI Home Repair Marketplace backend (Node.js/Express)",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node --env-file-if-exists=.env server.js",
+    "dev": "node --env-file-if-exists=.env dev-pg.js",
+    "stripe:check": "node scripts/stripe-check.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "pg": "^8.21.0",
+    "stripe": "^22.2.0",
+    "web-push": "^3.6.7",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "embedded-postgres": "^18.3.0-beta.17"
+  }
+}
