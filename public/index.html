@@ -1,10 +1,19 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<link rel="apple-touch-icon" href="/icon.png">
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>FixIt — AI Home Repair</title>
+<!-- PWA / install -->
+<link rel="manifest" href="/manifest.json">
+<meta name="theme-color" content="#09090b">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="FixIt">
+<meta name="description" content="Snap a photo, get an instant AI repair diagnosis, and book a vetted contractor.">
+<style id="pwa-safe-area">body{padding-top:env(safe-area-inset-top);padding-bottom:env(safe-area-inset-bottom)}</style>
 <style>
   :root {
     --bg:#09090b; --surface:#111115; --card:#18181c; --border:#222228;
@@ -1096,6 +1105,7 @@ function App() {
   const [apiStatus, setApiStatus] = useState('checking');
 
   useEffect(()=>{
+    if('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(()=>{});
     fetch(API+'/api/health').then(r=>r.json()).then(()=>setApiStatus('online')).catch(()=>setApiStatus('offline'));
     if(getToken()) {
       auth.me().then(r=>{ if(r && r.user){ setUser(r.user); setupPush(); } }).finally(()=>setReady(true));
