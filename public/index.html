@@ -498,21 +498,29 @@ function ChatTab({ws, user}) {
   const bottomRef = useRef();
   const typingTimer = useRef();
 
+  const [rating, setRating] = useState(0);
+  const [rComment, setRComment] = useState('');
+  const [showRate, setShowRate] = useState(false);
+  const [rBusy, setRBusy] = useState(false);
+
   // Build the conversation list from this user's bookings.
-  useEffect(()=>{
-    api('/api/bookings').then(rows=>{
-      const list = (Array.isArray(rows)?rows:[]).filter(b=>b.chat_room_id).map(b=>({
-        roomId: b.chat_room_id,
-        title: user.role==='contractor' ? b.homeowner_name : b.contractor_name,
-        sub: (b.category||'Job')+' · '+(b.status||'pending'),
-      }));
-      setConvos(list);
-      setActiveRoom(r => r || (list[0] && list[0].roomId) || null);
-    }).catch(()=>{});
-  },[user.role]);
+  const loadConvos = () => api('/api/bookings').then(rows=>{
+    const list = (Array.isArray(rows)?rows:[]).filter(b=>b.chat_room_id).map(b=>({
+      roomId: b.chat_room_id,
+      bookingId: b.id,
+      title: user.role==='contractor' ? b.homeowner_name : b.contractor_name,
+      sub: (b.category||'Job')+' · '+(b.status||'pending'),
+      status: b.status,
+      reviewed: b.reviewed,
+    }));
+    setConvos(list);
+    setActiveRoom(r => r || (list[0] && list[0].roomId) || null);
+  }).catch(()=>{});
+  useEffect(()=>{ loadConvos(); },[user.role]);
 
   // Load history when the active room changes.
   useEffect(()=>{
+    setShowRate(false); setRating(0); setRComment('');
     if(!activeRoom){ setMessages([]); return; }
     api(`/api/chat/${activeRoom}/messages`).then(msgs=>setMessages(Array.isArray(msgs)?msgs:[])).catch(()=>{});
   },[activeRoom]);
@@ -540,8 +548,20 @@ function ChatTab({ws, user}) {
     setSending(false);
   };
 
+  const submitReview = async ()=>{
+    if(!active || !rating) return;
+    setRBusy(true);
+    try {
+      const r = await api('/api/reviews',{method:'POST',body:{bookingId:active.bookingId,rating,comment:rComment}});
+      if(r && r.success){ setShowRate(false); setRating(0); setRComment(''); await loadConvos(); }
+      else alert((r&&r.error)||'Could not submit review');
+    } catch(e){ console.error(e); }
+    setRBusy(false);
+  };
+
   const isMe = msg => msg.sender_id===user.id;
   const active = convos.find(c=>c.roomId===activeRoom);
+  const canRate = user.role==='homeowner' && active && active.status==='paid' && !active.reviewed;
 
   if(convos.length===0) return e('div',{style:{...css.card,textAlign:'center',padding:'40px 20px'}},
     e('div',{style:{fontSize:32,marginBottom:10}},'💬'),
@@ -564,7 +584,21 @@ function ChatTab({ws, user}) {
         e('div',{style:{fontWeight:700,fontSize:14}},(active&&active.title)||'Conversation'),
         e('div',{style:{fontSize:11,color:ws.connected?'var(--green)':'var(--muted)'}},ws.connected?'● WebSocket Live':'● Reconnecting...')
       ),
+      canRate && e('button',{onClick:()=>setShowRate(s=>!s),style:{...css.btn('xs'),background:'var(--grad)'}},'⭐ Rate'),
+      (active&&active.reviewed) && e('span',{style:css.badge('var(--green)')},'★ Rated'),
       e('span',{style:css.badge(ws.connected?'var(--green)':'var(--yellow)')},ws.connected?'WS ●':'WS ○')
+    ),
+
+    // Rating form
+    showRate && canRate && e('div',{style:{...css.card,marginBottom:12,padding:14}},
+      e('div',{style:{fontWeight:700,fontSize:14,marginBottom:8}},'Rate ',active.title),
+      e('div',{style:{display:'flex',gap:6,marginBottom:10}},
+        [1,2,3,4,5].map(n=>e('button',{key:n,onClick:()=>setRating(n),style:{background:'none',border:'none',cursor:'pointer',fontSize:26,padding:0,lineHeight:1,filter:n<=rating?'none':'grayscale(1) opacity(.4)'}},'⭐'))
+      ),
+      e('textarea',{style:{...css.input,resize:'none',marginBottom:10},rows:2,placeholder:'Optional: how did it go?',value:rComment,onChange:ev=>setRComment(ev.target.value)}),
+      e('div',{style:{display:'flex',gap:8}},
+        e('button',{style:{...css.btn('ghost'),flex:1},onClick:()=>setShowRate(false)},'Cancel'),
+        e('button',{style:{...css.btn(),flex:1,opacity:rating&&!rBusy?1:.5},disabled:!rating||rBusy,onClick:submitReview},rBusy?'…':'Submit review'))
     ),
 
     // Messages
@@ -1003,7 +1037,12 @@ function AuthScreen({onAuth}) {
         mode==='login'?'New to FixIt? ':'Already have an account? ',
         e('span',{style:{color:'var(--accent)',cursor:'pointer',fontWeight:700},onClick:()=>{setMode(mode==='login'?'signup':'login');setErr('');}},
           mode==='login'?'Sign up':'Log in'))
-    )
+    ),
+    e('p',{style:{textAlign:'center',fontSize:11,color:'var(--dim)',marginTop:18}},
+      'By continuing you agree to our ',
+      e('a',{href:'/terms.html',style:{color:'var(--muted)'}},'Terms'),
+      ' & ',
+      e('a',{href:'/privacy.html',style:{color:'var(--muted)'}},'Privacy Policy'))
   );
 }
 

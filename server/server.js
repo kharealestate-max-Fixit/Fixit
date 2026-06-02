@@ -279,6 +279,49 @@ app.get('/api/contractors/:id(\\d+)', h(async (req, res) => {
   res.json(row);
 }));
 
+// ─── Reviews ──────────────────────────────────────────────────────────────────
+app.get('/api/contractors/:id(\\d+)/reviews', h(async (req, res) => {
+  const cid = parseInt(req.params.id, 10);
+  const rows = await all(`
+    SELECT rv.id, rv.rating, rv.comment, rv.created_at,
+      u.first_name||' '||SUBSTR(u.last_name,1,1)||'.' AS reviewer
+    FROM reviews rv JOIN users u ON rv.homeowner_id=u.id
+    WHERE rv.contractor_id=$1 ORDER BY rv.created_at DESC
+  `, [cid]);
+  res.json(rows);
+}));
+
+// Homeowner leaves a review for a paid booking (once).
+app.post('/api/reviews', authRequired, h(async (req, res) => {
+  if (req.user.role !== 'homeowner') return res.status(403).json({ error: 'only homeowners can review' });
+  const b = req.body || {};
+  const rating = Math.max(1, Math.min(5, parseInt(b.rating, 10) || 0));
+  if (!rating) return res.status(400).json({ error: 'rating 1-5 required' });
+
+  const booking = await one('SELECT * FROM bookings WHERE id=$1', [b.bookingId]);
+  if (!booking) return res.status(404).json({ error: 'booking not found' });
+  if (booking.homeowner_id !== req.user.id) return res.status(403).json({ error: 'not your booking' });
+  if (booking.status !== 'paid') return res.status(400).json({ error: 'you can review after the job is paid' });
+
+  const dup = await one('SELECT id FROM reviews WHERE booking_id=$1', [booking.id]);
+  if (dup) return res.status(409).json({ error: 'already reviewed' });
+
+  await query(`
+    INSERT INTO reviews (booking_id, contractor_id, homeowner_id, rating, comment)
+    VALUES ($1,$2,$3,$4,$5)
+  `, [booking.id, booking.contractor_id, req.user.id, rating, (b.comment || '').trim() || null]);
+
+  // Recompute the contractor's rating + count from real reviews.
+  const agg = await one(
+    'SELECT ROUND(AVG(rating)::numeric,1)::float AS avg, COUNT(*)::int AS cnt FROM reviews WHERE contractor_id=$1',
+    [booking.contractor_id]
+  );
+  await query('UPDATE contractors SET rating=$1, review_count=$2 WHERE id=$3',
+    [agg.avg, agg.cnt, booking.contractor_id]);
+
+  res.status(201).json({ success: true, rating: agg.avg, review_count: agg.cnt });
+}));
+
 // ─── Create booking ───────────────────────────────────────────────────────────
 app.post('/api/bookings', authOptional, h(async (req, res) => {
   const b = req.body || {};
@@ -319,11 +362,13 @@ app.get('/api/bookings', authOptional, h(async (req, res) => {
   const rows = await all(`
     SELECT b.*, c.business_name AS contractor_name,
       u.first_name||' '||u.last_name AS homeowner_name,
-      cr.id AS chat_room_id
+      cr.id AS chat_room_id,
+      (rv.id IS NOT NULL) AS reviewed
     FROM bookings b
     JOIN contractors c ON b.contractor_id=c.id
     JOIN users u ON b.homeowner_id=u.id
     LEFT JOIN chat_rooms cr ON cr.booking_id=b.id
+    LEFT JOIN reviews rv ON rv.booking_id=b.id
     WHERE ${where} ORDER BY b.created_at DESC
   `, [userId]);
   res.json(rows);
