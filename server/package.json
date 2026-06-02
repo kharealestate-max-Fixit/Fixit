@@ -13,8 +13,10 @@
     "node": ">=20"
   },
   "dependencies": {
+    "bcryptjs": "^3.0.3",
     "cors": "^2.8.5",
     "express": "^4.21.2",
+    "jsonwebtoken": "^9.0.3",
     "pg": "^8.21.0",
     "stripe": "^22.2.0",
     "web-push": "^3.6.7",

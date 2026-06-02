@@ -49,10 +49,25 @@ const WS_URL = SAME_ORIGIN
   ? (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host
   : 'ws://localhost:3001';
 
+// ─── Auth token (persisted) ───────────────────────────────────────────────────
+const TOKEN_KEY = 'fixit_token';
+const getToken = () => localStorage.getItem(TOKEN_KEY) || '';
+const setToken = (t) => t ? localStorage.setItem(TOKEN_KEY, t) : localStorage.removeItem(TOKEN_KEY);
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 const api = async (path, opts={}) => {
-  const r = await fetch(API + path, {headers:{'Content-Type':'application/json',...(opts.headers||{})}, ...opts, body: opts.body ? JSON.stringify(opts.body) : undefined});
+  const token = getToken();
+  const headers = {'Content-Type':'application/json', ...(token?{'Authorization':'Bearer '+token}:{}), ...(opts.headers||{})};
+  const r = await fetch(API + path, {headers, ...opts, body: opts.body ? JSON.stringify(opts.body) : undefined});
+  if (r.status === 401) { setToken(''); }
   return r.json();
+};
+
+const auth = {
+  signup: (body) => api('/api/auth/signup', {method:'POST', body}),
+  login:  (body) => api('/api/auth/login',  {method:'POST', body}),
+  me:     () => api('/api/auth/me'),
+  logout: () => { setToken(''); location.reload(); },
 };
 
 // ─── Web push setup (graceful: no-ops where unsupported) ──────────────────────
@@ -112,7 +127,9 @@ function useWS(userId) {
   const connect = useCallback(() => {
     if (!userId) return;
     try {
-      const sock = new WebSocket(`${WS_URL}?userId=${userId}`);
+      const token = getToken();
+      const qs = token ? `token=${token}` : `userId=${userId}`;
+      const sock = new WebSocket(`${WS_URL}?${qs}`);
       sock.onopen = () => { setConnected(true); attempts.current=0; console.log('[WS] connected'); };
       sock.onmessage = ev => {
         try {
@@ -205,7 +222,7 @@ function HomeownerTab({ws}) {
 
   const book = async (contractor) => {
     setSelected(contractor);
-    const r = await api('/api/bookings',{method:'POST',body:{contractorId:contractor.id,homeownerId:4,category:category.replace(/^\S+ /,''),description,estPrice:contractor.base_price,scheduledAt:new Date(Date.now()+3600000).toISOString()}});
+    const r = await api('/api/bookings',{method:'POST',body:{contractorId:contractor.id,category:category.replace(/^\S+ /,''),description,estPrice:contractor.base_price,scheduledAt:new Date(Date.now()+3600000).toISOString()}});
     setBooking(r.booking);
     setStep('pay');
   };
@@ -359,91 +376,91 @@ function HomeownerTab({ws}) {
 }
 
 // ─── Real-time Chat ───────────────────────────────────────────────────────────
-function ChatTab({ws}) {
-  const ROOM_ID = 1; // Demo room
-  const USER_ID = 4; // homeowner
+function ChatTab({ws, user}) {
+  const [convos, setConvos] = useState([]);
+  const [activeRoom, setActiveRoom] = useState(null);
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
   const [isTyping, setIsTyping] = useState(false);
   const [sending, setSending] = useState(false);
-  const [viewAs, setViewAs] = useState('homeowner');
-  const [connected, setConnected] = useState(ws.connected);
   const bottomRef = useRef();
   const typingTimer = useRef();
 
+  // Build the conversation list from this user's bookings.
   useEffect(()=>{
-    // Load history from real backend
-    api(`/api/chat/${ROOM_ID}/messages`).then(msgs=>{
-      if(msgs.length===0) {
-        // Seed a welcome message
-        setMessages([{id:'w1',sender_name:'System',text:'Chat room ready. Messages are stored in PostgreSQL and delivered via WebSocket.',msg_type:'system',created_at:new Date().toISOString()}]);
-      } else setMessages(msgs);
+    api('/api/bookings').then(rows=>{
+      const list = (Array.isArray(rows)?rows:[]).filter(b=>b.chat_room_id).map(b=>({
+        roomId: b.chat_room_id,
+        title: user.role==='contractor' ? b.homeowner_name : b.contractor_name,
+        sub: (b.category||'Job')+' · '+(b.status||'pending'),
+      }));
+      setConvos(list);
+      setActiveRoom(r => r || (list[0] && list[0].roomId) || null);
     }).catch(()=>{});
-  },[]);
+  },[user.role]);
+
+  // Load history when the active room changes.
+  useEffect(()=>{
+    if(!activeRoom){ setMessages([]); return; }
+    api(`/api/chat/${activeRoom}/messages`).then(msgs=>setMessages(Array.isArray(msgs)?msgs:[])).catch(()=>{});
+  },[activeRoom]);
 
   useEffect(()=>{
     const unsub = ws.on('new_message', msg=>{
-      if(msg.chatRoomId===ROOM_ID) setMessages(p=>[...p, msg.message]);
+      if(msg.chatRoomId===activeRoom) setMessages(p=>[...p, msg.message]);
     });
     const unsubTyping = ws.on('typing', msg=>{
-      if(msg.chatRoomId===ROOM_ID){ setIsTyping(true); clearTimeout(typingTimer.current); typingTimer.current=setTimeout(()=>setIsTyping(false),3000); }
+      if(msg.chatRoomId===activeRoom){ setIsTyping(true); clearTimeout(typingTimer.current); typingTimer.current=setTimeout(()=>setIsTyping(false),3000); }
     });
     return ()=>{ unsub(); unsubTyping(); };
-  },[ws]);
+  },[ws, activeRoom]);
 
   useEffect(()=>{ bottomRef.current?.scrollIntoView({behavior:'smooth'}); },[messages,isTyping]);
 
   const send = async ()=>{
-    if(!input.trim()) return;
+    if(!input.trim() || !activeRoom) return;
     setSending(true);
     const text = input; setInput('');
-    const sender = viewAs==='homeowner'?USER_ID:1; // 1=Mario contractor
     try {
-      const msg = await api(`/api/chat/${ROOM_ID}/messages`,{method:'POST',body:{senderId:sender,text}});
-      setMessages(p=>[...p,msg]);
+      const msg = await api(`/api/chat/${activeRoom}/messages`,{method:'POST',body:{text}});
+      if(msg && msg.id) setMessages(p=>[...p,msg]);
     } catch(e){ console.error(e); }
     setSending(false);
   };
 
-  const sendSpecial = async (type, text) => {
-    const msg = await api(`/api/chat/${ROOM_ID}/messages`,{method:'POST',body:{senderId:1,text,type}});
-    setMessages(p=>[...p,{...msg,msg_type:type}]);
-  };
+  const isMe = msg => msg.sender_id===user.id;
+  const active = convos.find(c=>c.roomId===activeRoom);
 
-  const isMe = msg => (viewAs==='homeowner' && msg.sender_id===USER_ID) || (viewAs==='contractor' && msg.sender_id===1);
+  if(convos.length===0) return e('div',{style:{...css.card,textAlign:'center',padding:'40px 20px'}},
+    e('div',{style:{fontSize:32,marginBottom:10}},'💬'),
+    e('div',{style:{fontWeight:700,marginBottom:6}},'No conversations yet'),
+    e('div',{style:{fontSize:13,color:'var(--muted)'}}, user.role==='contractor'
+      ? 'When a homeowner books you, your chat appears here.'
+      : 'Book a contractor and your chat opens here.')
+  );
 
   return e('div',null,
+    // Conversation switcher (when more than one)
+    convos.length>1 && e('div',{style:{display:'flex',gap:6,overflowX:'auto',marginBottom:12,paddingBottom:2}},
+      convos.map(c=>e('button',{key:c.roomId,onClick:()=>setActiveRoom(c.roomId),style:{flexShrink:0,padding:'7px 12px',borderRadius:20,border:'none',fontSize:12,fontWeight:700,cursor:'pointer',fontFamily:'inherit',background:c.roomId===activeRoom?'var(--accent)':'var(--surface)',color:c.roomId===activeRoom?'#fff':'var(--muted)'}},c.title))
+    ),
+
     // Header
     e('div',{style:{display:'flex',alignItems:'center',gap:10,marginBottom:14}},
-      e('div',{style:{width:40,height:40,borderRadius:12,background:'var(--grad)',display:'flex',alignItems:'center',justifyContent:'center',fontWeight:800,fontSize:13}},'MP'),
+      e('div',{style:{width:40,height:40,borderRadius:12,background:'var(--grad)',display:'flex',alignItems:'center',justifyContent:'center',fontWeight:800,fontSize:13}},((active&&active.title)||'?').slice(0,2).toUpperCase()),
       e('div',{style:{flex:1}},
-        e('div',{style:{fontWeight:700,fontSize:14}},'Martinez Pro Plumbing'),
+        e('div',{style:{fontWeight:700,fontSize:14}},(active&&active.title)||'Conversation'),
         e('div',{style:{fontSize:11,color:ws.connected?'var(--green)':'var(--muted)'}},ws.connected?'● WebSocket Live':'● Reconnecting...')
       ),
       e('span',{style:css.badge(ws.connected?'var(--green)':'var(--yellow)')},ws.connected?'WS ●':'WS ○')
     ),
 
-    // View toggle
-    e('div',{style:{display:'flex',background:'var(--surface)',borderRadius:10,padding:3,marginBottom:12}},
-      ['homeowner','contractor'].map(v=>e('button',{key:v,onClick:()=>setViewAs(v),style:{flex:1,padding:'7px',borderRadius:8,border:'none',fontSize:12,fontWeight:700,cursor:'pointer',fontFamily:'inherit',background:viewAs===v?'var(--accent)':'transparent',color:viewAs===v?'#fff':'var(--muted)',transition:'all .2s'}},v==='homeowner'?'🏠 Homeowner':'🔨 Contractor'))
-    ),
-
     // Messages
     e('div',{style:{...css.card,height:280,overflowY:'auto',marginBottom:12,display:'flex',flexDirection:'column',gap:10,padding:'14px'}},
+      messages.length===0 && e('div',{style:{textAlign:'center',fontSize:12,color:'var(--dim)',margin:'auto'}},'Say hello 👋'),
       messages.map(msg=>{
         const me = isMe(msg);
         if(msg.msg_type==='system') return e('div',{key:msg.id,style:{textAlign:'center',fontSize:11,color:'var(--dim)',padding:'4px 0'}},msg.text);
-        if(msg.msg_type==='quote') return e('div',{key:msg.id,style:{alignSelf:'flex-start',maxWidth:'85%'}},
-          e('div',{style:{background:'rgba(16,185,129,.12)',border:'1px solid rgba(16,185,129,.3)',borderRadius:14,padding:14}},
-            e('div',{style:{fontSize:10,color:'var(--green)',fontWeight:700,marginBottom:6}},'💼 JOB QUOTE'),
-            e('div',{style:{fontWeight:800,fontSize:22,color:'var(--green)',marginBottom:4}},'$185'),
-            e('div',{style:{fontSize:12,color:'var(--muted)',marginBottom:10}},'Kitchen sink leak repair · Parts + labor'),
-            e('div',{style:{display:'flex',gap:8}},
-              e('button',{style:{...css.btn('sm'),background:'var(--green)'}},'✓ Accept'),
-              e('button',{style:css.btn('ghost')},'Decline')
-            )
-          )
-        );
         return e('div',{key:msg.id,style:{alignSelf:me?'flex-end':'flex-start',maxWidth:'80%',display:'flex',flexDirection:'column',gap:3}},
           e('div',{style:{background:me?'var(--accent)':'var(--surface)',borderRadius:me?'14px 14px 4px 14px':'14px 14px 14px 4px',padding:'9px 13px',fontSize:13,lineHeight:1.5}},msg.text),
           e('div',{style:{fontSize:10,color:'var(--dim)',textAlign:me?'right':'left'}},
@@ -459,16 +476,10 @@ function ChatTab({ws}) {
       e('div',{ref:bottomRef})
     ),
 
-    // Quick actions
-    viewAs==='contractor' && e('div',{style:{display:'flex',gap:6,marginBottom:8}},
-      e('button',{style:{...css.btn('ghost'),flex:1,fontSize:11},onClick:()=>sendSpecial('quote','[quote]')},'💼 Send Quote'),
-      e('button',{style:{...css.btn('ghost'),flex:1,fontSize:11},onClick:()=>sendSpecial('text','I can be there at 2pm — does that work?')},'⏰ Confirm Time')
-    ),
-
     // Input
     e('div',{style:{display:'flex',gap:8}},
       e('input',{style:{...css.input,flex:1},value:input,onChange:ev=>setInput(ev.target.value),onKeyDown:ev=>ev.key==='Enter'&&send(),placeholder:'Message... (Enter to send)',
-        onInput:()=>ws.send({type:'typing',chatRoomId:ROOM_ID})}),
+        onInput:()=>activeRoom&&ws.send({type:'typing',chatRoomId:activeRoom})}),
       e('button',{style:{...css.btn(),flexShrink:0,padding:'11px 16px',opacity:input.trim()&&!sending?1:.4},onClick:send},sending?'…':'↑')
     ),
     e('p',{style:{textAlign:'center',fontSize:10,color:'var(--dim)',marginTop:8}},'Messages stored in PostgreSQL · Real-time via WebSocket')
@@ -678,8 +689,8 @@ function DashboardTab({ws}) {
   const [newLeadCount, setNewLeadCount] = useState(0);
 
   useEffect(()=>{
-    api('/api/bookings?role=contractor&userId=1').then(rows=>{
-      setLeads(rows);
+    api('/api/bookings').then(rows=>{
+      setLeads(Array.isArray(rows)?rows:[]);
     }).catch(()=>{});
   },[]);
 
@@ -794,50 +805,155 @@ function DashboardTab({ws}) {
 }
 
 // ─── ROOT ─────────────────────────────────────────────────────────────────────
-function App() {
-  const [tab, setTab] = useState('homeowner');
-  const ws = useWS('4'); // homeowner user id
-  const [apiStatus, setApiStatus] = useState('checking');
+// ─── Auth screen (login / signup) ─────────────────────────────────────────────
+function getGeo() {
+  return new Promise(res=>{
+    if(!navigator.geolocation) return res(null);
+    navigator.geolocation.getCurrentPosition(
+      p=>res({lat:p.coords.latitude, lng:p.coords.longitude}),
+      ()=>res(null), {timeout:4000});
+  });
+}
 
-  useEffect(()=>{
-    fetch(API+'/api/health').then(r=>r.json()).then(()=>setApiStatus('online')).catch(()=>setApiStatus('offline'));
-    setupPush('4'); // subscribe this browser to push as the homeowner
-  },[]);
+function AuthScreen({onAuth}) {
+  const [mode, setMode] = useState('login');
+  const [role, setRole] = useState('homeowner');
+  const [f, setF] = useState({email:'',password:'',firstName:'',lastName:'',businessName:'',specialties:'',basePrice:''});
+  const [err, setErr] = useState('');
+  const [busy, setBusy] = useState(false);
+  const set = k => ev => setF(p=>({...p,[k]:ev.target.value}));
+
+  const submit = async ()=>{
+    setErr(''); setBusy(true);
+    try {
+      let r;
+      if(mode==='login') {
+        r = await auth.login({email:f.email, password:f.password});
+      } else {
+        const body = {email:f.email, password:f.password, firstName:f.firstName, lastName:f.lastName, role};
+        if(role==='contractor') {
+          body.businessName = f.businessName;
+          body.specialties = f.specialties.split(',').map(s=>s.trim()).filter(Boolean);
+          body.basePrice = Number(f.basePrice)||150;
+          const geo = await getGeo();
+          if(geo){ body.lat=geo.lat; body.lng=geo.lng; }
+        }
+        r = await auth.signup(body);
+      }
+      if(r && r.token){ setToken(r.token); onAuth(r.user); }
+      else setErr((r && r.error) || 'Something went wrong');
+    } catch(e){ setErr(e.message||'Network error'); }
+    setBusy(false);
+  };
+
+  const field = (key,label,type='text',ph='') => e('div',{key,style:{marginBottom:12}},
+    e('label',{style:css.label},label),
+    e('input',{style:css.input,type,placeholder:ph,value:f[key],onChange:set(key),
+      onKeyDown:ev=>ev.key==='Enter'&&submit()}));
+
+  return e('div',{style:{minHeight:'100vh',background:'var(--bg)',color:'var(--text)',fontFamily:"'DM Sans',system-ui,sans-serif",display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',padding:'20px'}},
+    e('div',{style:{display:'flex',alignItems:'center',gap:10,marginBottom:8}},
+      e('div',{style:{width:38,height:38,borderRadius:11,background:'var(--grad)',display:'flex',alignItems:'center',justifyContent:'center',fontSize:18}},'🔩'),
+      e('span',{style:{fontSize:26,fontWeight:800,letterSpacing:-.5}},'Fix',e('span',{style:{color:'var(--accent)'}},'It'))
+    ),
+    e('p',{style:{color:'var(--muted)',fontSize:13,marginBottom:22}},'AI-powered home repair, on demand'),
+
+    e('div',{style:{...css.card,width:'100%',maxWidth:380}},
+      // Login / Signup toggle
+      e('div',{style:{display:'flex',background:'var(--surface)',borderRadius:10,padding:3,marginBottom:18}},
+        ['login','signup'].map(m=>e('button',{key:m,onClick:()=>{setMode(m);setErr('');},style:{flex:1,padding:'8px',borderRadius:8,border:'none',fontSize:13,fontWeight:700,cursor:'pointer',fontFamily:'inherit',background:mode===m?'var(--accent)':'transparent',color:mode===m?'#fff':'var(--muted)'}},m==='login'?'Log in':'Sign up'))
+      ),
+
+      mode==='signup' && e('div',{style:{display:'flex',background:'var(--surface)',borderRadius:10,padding:3,marginBottom:14}},
+        [['homeowner','🏠 Homeowner'],['contractor','🔨 Contractor']].map(([v,lbl])=>e('button',{key:v,onClick:()=>setRole(v),style:{flex:1,padding:'7px',borderRadius:8,border:'none',fontSize:12,fontWeight:700,cursor:'pointer',fontFamily:'inherit',background:role===v?'var(--grad)':'transparent',color:role===v?'#fff':'var(--muted)'}},lbl))
+      ),
+
+      mode==='signup' && e('div',{style:{display:'flex',gap:8}},
+        e('div',{style:{flex:1}}, field('firstName','First name','text','Jane')),
+        e('div',{style:{flex:1}}, field('lastName','Last name','text','Doe'))
+      ),
+      field('email','Email','email','you@example.com'),
+      field('password','Password','password','min 6 characters'),
+
+      mode==='signup' && role==='contractor' && e('div',null,
+        field('businessName','Business name','text','Jane Doe Plumbing'),
+        field('specialties','Specialties (comma-separated)','text','Plumbing, Leak Repair'),
+        field('basePrice','Base price ($/visit)','number','150'),
+        e('p',{style:{fontSize:11,color:'var(--dim)',marginTop:-4,marginBottom:10}},'We\'ll use your location so nearby homeowners can find you.')
+      ),
+
+      err && e('div',{style:{background:'rgba(239,68,68,.12)',color:'var(--red)',fontSize:12,padding:'9px 12px',borderRadius:8,marginBottom:12}},err),
+
+      e('button',{style:{...css.btn(),width:'100%',opacity:busy?.6:1},disabled:busy,onClick:submit},
+        busy?'…':(mode==='login'?'Log in →':'Create account →')),
+
+      e('p',{style:{textAlign:'center',fontSize:12,color:'var(--muted)',marginTop:14}},
+        mode==='login'?'New to FixIt? ':'Already have an account? ',
+        e('span',{style:{color:'var(--accent)',cursor:'pointer',fontWeight:700},onClick:()=>{setMode(mode==='login'?'signup':'login');setErr('');}},
+          mode==='login'?'Sign up':'Log in'))
+    )
+  );
+}
+
+// ─── Logged-in app shell ──────────────────────────────────────────────────────
+function AppShell({user, onLogout, apiStatus}) {
+  const ws = useWS(String(user.id));
+  const isContractor = user.role==='contractor';
+  const tabs = TABS.filter(t => isContractor
+    ? ['dashboard','chat','push'].includes(t.id)
+    : ['homeowner','chat','map','push'].includes(t.id));
+  const [tab, setTab] = useState(tabs[0].id);
 
   return e('div',{style:{minHeight:'100vh',background:'var(--bg)',color:'var(--text)',fontFamily:"'DM Sans',system-ui,sans-serif"}},
-    // Header
     e('header',{style:{padding:'16px 20px 0',display:'flex',alignItems:'center',justifyContent:'space-between',maxWidth:500,margin:'0 auto'}},
       e('div',{style:{display:'flex',alignItems:'center',gap:10}},
         e('div',{style:{width:32,height:32,borderRadius:9,background:'var(--grad)',display:'flex',alignItems:'center',justifyContent:'center',fontSize:16}},'🔩'),
         e('span',{style:{fontSize:20,fontWeight:800,letterSpacing:-.5}},'Fix',e('span',{style:{color:'var(--accent)'}},'It'))
       ),
-      e('div',{style:{display:'flex',gap:8,alignItems:'center'}},
-        e('div',{style:{fontSize:10,color:apiStatus==='online'?'var(--green)':apiStatus==='offline'?'var(--red)':'var(--yellow)',fontWeight:700}},
-          apiStatus==='online'?'● API Live':apiStatus==='offline'?'● API Offline':'● Checking...'
+      e('div',{style:{display:'flex',gap:10,alignItems:'center'}},
+        e('div',{style:{textAlign:'right'}},
+          e('div',{style:{fontSize:12,fontWeight:700}},'Hi, '+user.firstName),
+          e('div',{style:{fontSize:9,color:apiStatus==='online'?'var(--green)':'var(--muted)',fontWeight:700}},
+            (ws.connected?'● Live':apiStatus==='online'?'● API':'● …')+' · '+(isContractor?'Contractor':'Homeowner'))
         ),
-        ws.connected && e('div',{style:{fontSize:10,color:'var(--green)',fontWeight:700}},'● WS Live')
+        e('button',{style:{...css.btn('ghost'),padding:'6px 10px',fontSize:11},onClick:onLogout},'Log out')
       )
     ),
 
-    // Nav
     e('nav',{style:{maxWidth:500,margin:'14px auto 0',padding:'0 20px'}},
       e('div',{style:{display:'flex',background:'var(--surface)',borderRadius:14,padding:4,gap:2}},
-        TABS.map(t=>e('button',{key:t.id,onClick:()=>setTab(t.id),style:{flex:1,padding:'9px 2px',borderRadius:10,border:'none',fontSize:11,fontWeight:700,cursor:'pointer',fontFamily:'inherit',background:t.id===tab?'var(--grad)':'transparent',color:t.id===tab?'#fff':'var(--muted)',transition:'all .2s',display:'flex',flexDirection:'column',alignItems:'center',gap:2}},
+        tabs.map(t=>e('button',{key:t.id,onClick:()=>setTab(t.id),style:{flex:1,padding:'9px 2px',borderRadius:10,border:'none',fontSize:11,fontWeight:700,cursor:'pointer',fontFamily:'inherit',background:t.id===tab?'var(--grad)':'transparent',color:t.id===tab?'#fff':'var(--muted)',transition:'all .2s',display:'flex',flexDirection:'column',alignItems:'center',gap:2}},
           e('span',{style:{fontSize:16}},t.label),
           e('span',null,t.name)
         ))
       )
     ),
 
-    // Content
     e('main',{style:{maxWidth:500,margin:'16px auto 0',padding:'0 20px 60px'}},
-      tab==='homeowner' && e(HomeownerTab,{ws}),
-      tab==='chat'      && e(ChatTab,{ws}),
+      tab==='homeowner' && e(HomeownerTab,{ws,user}),
+      tab==='chat'      && e(ChatTab,{ws,user}),
       tab==='map'       && e(MapTab,{}),
       tab==='push'      && e(PushTab,{ws}),
-      tab==='dashboard' && e(DashboardTab,{ws})
+      tab==='dashboard' && e(DashboardTab,{ws,user})
     )
   );
+}
+
+function App() {
+  const [user, setUser] = useState(null);
+  const [ready, setReady] = useState(false);
+  const [apiStatus, setApiStatus] = useState('checking');
+
+  useEffect(()=>{
+    fetch(API+'/api/health').then(r=>r.json()).then(()=>setApiStatus('online')).catch(()=>setApiStatus('offline'));
+    if(getToken()) {
+      auth.me().then(r=>{ if(r && r.user){ setUser(r.user); setupPush(); } }).finally(()=>setReady(true));
+    } else setReady(true);
+  },[]);
+
+  if(!ready) return e('div',{style:{minHeight:'100vh',background:'var(--bg)',display:'flex',alignItems:'center',justifyContent:'center',color:'var(--muted)',fontFamily:"'DM Sans',sans-serif"}},'Loading…');
+  if(!user) return e(AuthScreen,{onAuth:(u)=>{ setUser(u); setupPush(); }});
+  return e(AppShell,{user, apiStatus, onLogout:auth.logout});
 }
 
 ReactDOM.createRoot(document.getElementById('root')).render(e(App));

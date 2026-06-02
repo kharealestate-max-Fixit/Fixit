@@ -11,6 +11,7 @@ import {
   stripe, stripeEnabled, STRIPE_WEBHOOK_SECRET, PUBLIC_URL, PLATFORM_FEE_CENTS,
 } from './stripe.js';
 import { VAPID_PUBLIC_KEY, sendPush } from './push.js';
+import { hashPassword, verifyPassword, signToken, verifyToken, authRequired, authOptional } from './auth.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, '..', 'public');
@@ -144,6 +145,82 @@ app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', time: Date.now() / 1000, ws_users: wsClients.size });
 });
 
+// ═══════════════════════════════════════════════════════════════════════════
+// AUTH
+// ═══════════════════════════════════════════════════════════════════════════
+const publicUser = (u) => ({
+  id: u.id, email: u.email, firstName: u.first_name, lastName: u.last_name,
+  role: u.role, phone: u.phone, contractorId: u.contractor_id ?? null,
+});
+
+app.post('/api/auth/signup', h(async (req, res) => {
+  const b = req.body || {};
+  const email = (b.email || '').trim().toLowerCase();
+  const password = b.password || '';
+  const firstName = (b.firstName || '').trim();
+  const lastName = (b.lastName || '').trim();
+  const role = b.role === 'contractor' ? 'contractor' : 'homeowner';
+
+  if (!email || !email.includes('@')) return res.status(400).json({ error: 'valid email required' });
+  if (password.length < 6) return res.status(400).json({ error: 'password must be at least 6 characters' });
+  if (!firstName || !lastName) return res.status(400).json({ error: 'first and last name required' });
+
+  const existing = await one('SELECT id FROM users WHERE lower(email)=$1', [email]);
+  if (existing) return res.status(409).json({ error: 'email already registered' });
+
+  const password_hash = await hashPassword(password);
+  const user = await one(`
+    INSERT INTO users (email, phone, first_name, last_name, role, password_hash)
+    VALUES ($1,$2,$3,$4,$5,$6) RETURNING *
+  `, [email, b.phone || null, firstName, lastName, role, password_hash]);
+
+  // Contractors get a business profile so they show up in search immediately.
+  if (role === 'contractor') {
+    const avatar = (firstName[0] || '?').toUpperCase() + (lastName[0] || '').toUpperCase();
+    const specialties = Array.isArray(b.specialties) && b.specialties.length ? b.specialties : ['General Repair'];
+    const c = await one(`
+      INSERT INTO contractors (owner_user_id, business_name, avatar, specialties, base_price, lat, lng, verified, licensed)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,0,0) RETURNING id
+    `, [
+      user.id,
+      (b.businessName || `${firstName} ${lastName}`).trim(),
+      avatar,
+      JSON.stringify(specialties),
+      Number(b.basePrice) || 150,
+      Number(b.lat) || 34.0522,
+      Number(b.lng) || -118.2437,
+    ]);
+    user.contractor_id = c.id;
+  }
+
+  res.status(201).json({ token: signToken(user), user: publicUser(user) });
+}));
+
+app.post('/api/auth/login', h(async (req, res) => {
+  const b = req.body || {};
+  const email = (b.email || '').trim().toLowerCase();
+  const password = b.password || '';
+  const user = await one('SELECT * FROM users WHERE lower(email)=$1', [email]);
+  if (!user || !user.password_hash || !(await verifyPassword(password, user.password_hash))) {
+    return res.status(401).json({ error: 'invalid email or password' });
+  }
+  const c = user.role === 'contractor'
+    ? await one('SELECT id FROM contractors WHERE owner_user_id=$1', [user.id])
+    : null;
+  user.contractor_id = c?.id ?? null;
+  res.json({ token: signToken(user), user: publicUser(user) });
+}));
+
+app.get('/api/auth/me', authRequired, h(async (req, res) => {
+  const user = await one('SELECT * FROM users WHERE id=$1', [req.user.id]);
+  if (!user) return res.status(404).json({ error: 'user not found' });
+  const c = user.role === 'contractor'
+    ? await one('SELECT id FROM contractors WHERE owner_user_id=$1', [user.id])
+    : null;
+  user.contractor_id = c?.id ?? null;
+  res.json({ user: publicUser(user) });
+}));
+
 // ─── Contractors nearby ───────────────────────────────────────────────────────
 app.get('/api/contractors/nearby', h(async (req, res) => {
   let lat, lng, radius, category;
@@ -202,18 +279,19 @@ app.get('/api/contractors/:id(\\d+)', h(async (req, res) => {
 }));
 
 // ─── Create booking ───────────────────────────────────────────────────────────
-app.post('/api/bookings', h(async (req, res) => {
+app.post('/api/bookings', authOptional, h(async (req, res) => {
   const b = req.body || {};
+  const homeownerId = req.user?.id ?? b.homeownerId ?? 4;
   const booking = await one(`
     INSERT INTO bookings (homeowner_id, contractor_id, category, description, est_price, scheduled_at)
     VALUES ($1,$2,$3,$4,$5,$6) RETURNING *
-  `, [b.homeownerId ?? 4, b.contractorId, b.category, b.description, b.estPrice, b.scheduledAt]);
+  `, [homeownerId, b.contractorId, b.category, b.description, b.estPrice, b.scheduledAt]);
 
   const ownerRow = await one('SELECT owner_user_id FROM contractors WHERE id=$1', [b.contractorId]);
   const room = await one(`
     INSERT INTO chat_rooms (booking_id, homeowner_id, contractor_id)
     VALUES ($1,$2,$3) RETURNING id
-  `, [booking.id, b.homeownerId ?? 4, ownerRow?.owner_user_id]);
+  `, [booking.id, homeownerId, ownerRow?.owner_user_id]);
   const roomId = room.id;
 
   if (ownerRow) {
@@ -233,9 +311,9 @@ app.post('/api/bookings', h(async (req, res) => {
 }));
 
 // ─── Get bookings ─────────────────────────────────────────────────────────────
-app.get('/api/bookings', h(async (req, res) => {
-  const role = req.query.role ?? 'homeowner';
-  const userId = parseInt(req.query.userId ?? '4', 10);
+app.get('/api/bookings', authOptional, h(async (req, res) => {
+  const role = req.user?.role ?? req.query.role ?? 'homeowner';
+  const userId = req.user?.id ?? parseInt(req.query.userId ?? '4', 10);
   const where = role === 'contractor' ? 'c.owner_user_id=$1' : 'b.homeowner_id=$1';
   const rows = await all(`
     SELECT b.*, c.business_name AS contractor_name,
@@ -365,10 +443,10 @@ app.get('/api/chat/:roomId(\\d+)/messages', h(async (req, res) => {
   res.json(rows.reverse());
 }));
 
-app.post('/api/chat/:roomId(\\d+)/messages', h(async (req, res) => {
+app.post('/api/chat/:roomId(\\d+)/messages', authOptional, h(async (req, res) => {
   const roomId = parseInt(req.params.roomId, 10);
   const b = req.body || {};
-  const senderId = b.senderId ?? 4;
+  const senderId = req.user?.id ?? b.senderId ?? 4;
   const text = (b.text ?? '').trim();
   const msgType = b.type ?? 'text';
 
@@ -406,9 +484,10 @@ app.get('/api/push/vapid-public-key', (req, res) => {
   res.json({ publicKey: VAPID_PUBLIC_KEY });
 });
 
-app.post('/api/push/subscribe', h(async (req, res) => {
+app.post('/api/push/subscribe', authOptional, h(async (req, res) => {
   const b = req.body || {};
   const sub = b.subscription || {};
+  const userId = req.user?.id ?? b.userId ?? 4;
   await query(`
     INSERT INTO push_subs (user_id, endpoint, p256dh, auth)
     VALUES ($1,$2,$3,$4)
@@ -416,7 +495,7 @@ app.post('/api/push/subscribe', h(async (req, res) => {
       user_id = EXCLUDED.user_id,
       p256dh  = EXCLUDED.p256dh,
       auth    = EXCLUDED.auth
-  `, [b.userId ?? 4, sub.endpoint, sub.keys?.p256dh, sub.keys?.auth]);
+  `, [userId, sub.endpoint, sub.keys?.p256dh, sub.keys?.auth]);
   res.json({ success: true });
 }));
 
@@ -492,7 +571,9 @@ const wss = new WebSocketServer({ server });
 
 wss.on('connection', (sock, req) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
-  const userId = url.searchParams.get('userId') || '0';
+  // Prefer an authenticated token; fall back to the legacy userId query param.
+  const tokenUser = verifyToken(url.searchParams.get('token'));
+  const userId = tokenUser?.id ?? url.searchParams.get('userId') ?? '0';
   const uid = String(userId);
 
   if (!wsClients.has(uid)) wsClients.set(uid, new Set());
