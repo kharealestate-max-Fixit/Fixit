@@ -3,6 +3,7 @@
 import express from 'express';
 import cors from 'cors';
 import http from 'node:http';
+import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
@@ -618,7 +619,19 @@ app.get('/api/stats', h(async (req, res) => {
   res.json({ bookings, messages: msgs, users, ws_connections: conns });
 }));
 
-// ─── Static frontend (serves "/" → index.html and /icon.png) ──────────────────
+// ─── App shell with absolute share-image URLs ─────────────────────────────────
+// Link-preview scrapers (WhatsApp/iMessage/social) don't run JS and need an
+// absolute og:image URL. We fill %BASE_URL% with the live origin at request
+// time (RENDER_EXTERNAL_URL on Render, else the request host).
+const INDEX_HTML = fs.readFileSync(path.join(PUBLIC_DIR, 'index.html'), 'utf8');
+function serveIndex(req, res) {
+  const base = (process.env.RENDER_EXTERNAL_URL || `${req.protocol}://${req.get('host')}`).replace(/\/$/, '');
+  res.type('html').send(INDEX_HTML.replace(/%BASE_URL%/g, base));
+}
+app.get('/', serveIndex);
+app.get('/index.html', serveIndex);
+
+// ─── Static frontend (serves the rest: icons, og.png, sw.js, manifest…) ───────
 app.use(express.static(PUBLIC_DIR));
 
 // ─── 404 fallback (JSON, matching the Python server) ──────────────────────────

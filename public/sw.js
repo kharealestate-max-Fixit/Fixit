@@ -1,5 +1,5 @@
 // FixIt service worker — PWA offline shell + web push.
-const CACHE = 'fixit-v1';
+const CACHE = 'fixit-v2';   // bumped so the new logo/icons replace the cached v1 ones
 const SHELL = ['/', '/index.html', '/manifest.json', '/icon-192.png', '/icon-512.png', '/apple-touch-icon.png'];
 
 self.addEventListener('install', (e) => {
