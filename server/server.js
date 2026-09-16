@@ -323,9 +323,9 @@ app.post('/api/reviews', authRequired, h(async (req, res) => {
 }));
 
 // ─── Create booking ───────────────────────────────────────────────────────────
-app.post('/api/bookings', authOptional, h(async (req, res) => {
+app.post('/api/bookings', authRequired, h(async (req, res) => {
   const b = req.body || {};
-  const homeownerId = req.user?.id ?? b.homeownerId ?? 4;
+  const homeownerId = req.user.id;   // identity comes from the login token, never the request body
   const booking = await one(`
     INSERT INTO bookings (homeowner_id, contractor_id, category, description, est_price, scheduled_at)
     VALUES ($1,$2,$3,$4,$5,$6) RETURNING *
@@ -355,9 +355,9 @@ app.post('/api/bookings', authOptional, h(async (req, res) => {
 }));
 
 // ─── Get bookings ─────────────────────────────────────────────────────────────
-app.get('/api/bookings', authOptional, h(async (req, res) => {
-  const role = req.user?.role ?? req.query.role ?? 'homeowner';
-  const userId = req.user?.id ?? parseInt(req.query.userId ?? '4', 10);
+app.get('/api/bookings', authRequired, h(async (req, res) => {
+  const role = req.user.role;      // from the login token, not the query string
+  const userId = req.user.id;
   const where = role === 'contractor' ? 'c.owner_user_id=$1' : 'b.homeowner_id=$1';
   const rows = await all(`
     SELECT b.*, c.business_name AS contractor_name,
@@ -375,11 +375,16 @@ app.get('/api/bookings', authOptional, h(async (req, res) => {
 }));
 
 // ─── Stripe payment (real if STRIPE_SECRET_KEY set, else simulated) ───────────
-app.post('/api/payments/create-intent', h(async (req, res) => {
+app.post('/api/payments/create-intent', authRequired, h(async (req, res) => {
   const b = req.body || {};
   const contractorId = b.contractorId;
   const bookingId = b.bookingId;
   const amount = b.amount ?? 0;
+
+  // Only the homeowner who owns this booking may pay for it.
+  const ownRow = await one('SELECT homeowner_id FROM bookings WHERE id=$1', [bookingId]);
+  if (!ownRow) return res.status(404).json({ error: 'booking not found' });
+  if (ownRow.homeowner_id !== req.user.id) return res.status(403).json({ error: "that booking isn't yours" });
 
   if (stripeEnabled()) {
     const contractorRow = await one('SELECT stripe_account FROM contractors WHERE id=$1', [contractorId]);
@@ -429,10 +434,11 @@ app.get('/api/payments/config', (req, res) => {
 
 // Called after the browser confirms a card payment — verifies the PaymentIntent
 // with Stripe and marks the booking paid (so we don't depend on the webhook).
-app.post('/api/payments/confirm', authOptional, h(async (req, res) => {
+app.post('/api/payments/confirm', authRequired, h(async (req, res) => {
   const bookingId = req.body?.bookingId;
   const booking = await one('SELECT * FROM bookings WHERE id=$1', [bookingId]);
   if (!booking) return res.status(404).json({ error: 'booking not found' });
+  if (booking.homeowner_id !== req.user.id) return res.status(403).json({ error: "that booking isn't yours" });
   if (booking.status === 'paid') return res.json({ status: 'paid' });
 
   if (stripeEnabled() && booking.stripe_intent) {
@@ -505,8 +511,11 @@ app.get('/api/connect/status', h(async (req, res) => {
 }));
 
 // ─── Chat messages ────────────────────────────────────────────────────────────
-app.get('/api/chat/:roomId(\\d+)/messages', h(async (req, res) => {
+app.get('/api/chat/:roomId(\\d+)/messages', authRequired, h(async (req, res) => {
   const roomId = parseInt(req.params.roomId, 10);
+  const room = await one('SELECT homeowner_id, contractor_id FROM chat_rooms WHERE id=$1', [roomId]);
+  if (!room || (req.user.id !== room.homeowner_id && req.user.id !== room.contractor_id))
+    return res.status(403).json({ error: "you don't have access to this conversation" });
   const limit = parseInt(req.query.limit ?? '50', 10);
   const rows = await all(`
     SELECT m.*, u.first_name||' '||u.last_name AS sender_name
@@ -516,16 +525,20 @@ app.get('/api/chat/:roomId(\\d+)/messages', h(async (req, res) => {
   res.json(rows.reverse());
 }));
 
-app.post('/api/chat/:roomId(\\d+)/messages', authOptional, h(async (req, res) => {
+app.post('/api/chat/:roomId(\\d+)/messages', authRequired, h(async (req, res) => {
   const roomId = parseInt(req.params.roomId, 10);
   const b = req.body || {};
-  const senderId = req.user?.id ?? b.senderId ?? 4;
+  const senderId = req.user.id;   // sender is the signed-in user, never a body field
   const text = (b.text ?? '').trim();
   const msgType = b.type ?? 'text';
 
   if (!text && msgType === 'text') {
     return res.status(400).json({ error: 'empty message' });
   }
+
+  const roomCheck = await one('SELECT homeowner_id, contractor_id FROM chat_rooms WHERE id=$1', [roomId]);
+  if (!roomCheck || (senderId !== roomCheck.homeowner_id && senderId !== roomCheck.contractor_id))
+    return res.status(403).json({ error: "you don't have access to this conversation" });
 
   const inserted = await one(`
     INSERT INTO messages (room_id, sender_id, text, msg_type)
@@ -557,10 +570,10 @@ app.get('/api/push/vapid-public-key', (req, res) => {
   res.json({ publicKey: VAPID_PUBLIC_KEY });
 });
 
-app.post('/api/push/subscribe', authOptional, h(async (req, res) => {
+app.post('/api/push/subscribe', authRequired, h(async (req, res) => {
   const b = req.body || {};
   const sub = b.subscription || {};
-  const userId = req.user?.id ?? b.userId ?? 4;
+  const userId = req.user.id;
   await query(`
     INSERT INTO push_subs (user_id, endpoint, p256dh, auth)
     VALUES ($1,$2,$3,$4)
