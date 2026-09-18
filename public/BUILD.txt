@@ -1,0 +1,2 @@
+build: wordmark-icons
+commit-intent: 3b60d54 (FixIt wordmark)
